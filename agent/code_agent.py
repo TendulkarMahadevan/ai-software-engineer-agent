@@ -4,6 +4,7 @@ from tools.context_extractor import ContextExtractor
 from patch.patch_generator import PatchGenerator
 from patch.pr_writer import PRWriter
 from llm.openai_client import LLMClient
+from utils.diff_validator import DiffValidator
 
 class CodeAgent:
 
@@ -38,7 +39,17 @@ class CodeAgent:
         context = self.extractor.extract_context(file_content, keyword)
 
         print("Generating patch...")
-        patch = self.patch_gen.generate_patch(issue_text, context)
+        patch = self.patch_gen.generate_patch(issue_text, files[0], context)
+
+        is_valid, message = DiffValidator.validate(patch, files)
+
+        if not is_valid:
+            print("\n⚠ Patch validation failed:")
+            print(message)
+            return
+
+        print("\n✔ Patch validation successful.")
+
 
         print("Generating PR description...")
         pr = self.pr_writer.generate_pr(issue_text, patch)
@@ -48,3 +59,7 @@ class CodeAgent:
 
         print("\n===== PR DESCRIPTION =====\n")
         print(pr)
+        
+    def log(self, step):
+        print(f"[AI-ENGINEER] {step}")
+
