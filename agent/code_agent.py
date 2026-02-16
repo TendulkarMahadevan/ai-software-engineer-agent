@@ -7,6 +7,7 @@ from llm.openai_client import LLMClient
 from utils import git_manager
 from utils.diff_validator import DiffValidator
 from utils.git_manager import GitManager
+from agent.keyword_extractor import KeywordExtractor
 
 class CodeAgent:
 
@@ -17,8 +18,10 @@ class CodeAgent:
         self.llm = LLMClient()
         self.patch_gen = PatchGenerator(self.llm)
         self.pr_writer = PRWriter(self.llm)
+        self.keyword_extractor = KeywordExtractor(self.llm)
 
-    def run(self, owner, repo, issue_number, keyword):
+
+    def run(self, owner, repo, issue_number):
         print("\nFetching issue...")
         issue = self.github.get_issue(owner, repo, issue_number)
 
@@ -29,7 +32,19 @@ class CodeAgent:
         repo_tree = self.github.get_repo_tree(owner, repo, branch)
 
         print("Searching files...")
-        files = self.search.search_files(repo_tree, keyword)
+        print("[AI-ENGINEER] Extracting keywords from issue...")
+
+        keywords = self.keyword_extractor.extract(issue_text)
+
+        print(f"[AI-ENGINEER] Keywords detected: {keywords}")
+        files = []
+        for kw in keywords:
+            matches = self.search.search_files(repo_tree, kw)
+            for m in matches:
+                if m not in files:
+                    files.append(m)
+
+        files = files[:5]
 
         if not files:
             print("No relevant files found.")
@@ -38,7 +53,10 @@ class CodeAgent:
         print(f"Using file: {files[0]}")
 
         file_content = self.github.get_file_content(owner, repo, files[0])
-        context = self.extractor.extract_context(file_content, keyword)
+        # Use first detected keyword for context extraction
+        primary_keyword = keywords[0] if keywords else ""
+
+        context = self.extractor.extract_context(file_content, primary_keyword)
 
         print("Generating patch...")
         patch = self.patch_gen.generate_patch(issue_text, files[0], context)
