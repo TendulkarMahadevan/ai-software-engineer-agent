@@ -13,7 +13,7 @@ class CodeAgent:
 
     def __init__(self):
         self.github = GitHubTool()
-        self.search = RepoSearchTool()
+        self.search = RepoSearchTool(self.github)
         self.extractor = ContextExtractor()
         self.llm = LLMClient()
         self.patch_gen = PatchGenerator(self.llm)
@@ -37,14 +37,7 @@ class CodeAgent:
         keywords = self.keyword_extractor.extract(issue_text)
 
         print(f"[AI-ENGINEER] Keywords detected: {keywords}")
-        files = []
-        for kw in keywords:
-            matches = self.search.search_files(repo_tree, kw)
-            for m in matches:
-                if m not in files:
-                    files.append(m)
-
-        files = files[:5]
+        files = self.search.search_files(repo_tree, keywords)
 
         if not files:
             print("No relevant files found.")

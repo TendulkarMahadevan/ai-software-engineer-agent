@@ -37,17 +37,32 @@ class GitHubTool:
         response.raise_for_status()
         return response.json()["tree"]
 
-    def get_file_content(self, owner, repo, path):
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+    def get_file_content(self, owner_or_url, repo=None, path=None):
+            """
+            Supports two modes:
+            1. get_file_content(file_url)
+            2. get_file_content(owner, repo, path)
+            """
 
-        data = response.json()
+            # Mode 1: Direct file URL
+            if repo is None and path is None:
+                file_url = owner_or_url
 
-        if data.get("encoding") != "base64":
-            raise Exception("Unsupported file encoding")
+            # Mode 2: owner, repo, path
+            else:
+                owner = owner_or_url
+                file_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
 
-        try:
-            return base64.b64decode(data["content"]).decode("utf-8")
-        except UnicodeDecodeError:
-            raise Exception("File is not valid UTF-8 text")
+            response = requests.get(file_url, headers=self.headers)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if "content" in data:
+                content = data["content"]
+                decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
+                return decoded
+
+            return ""
+
+
