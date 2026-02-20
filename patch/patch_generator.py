@@ -1,31 +1,39 @@
-class PatchGenerator:
+class FileRewriter:
 
     def __init__(self, llm):
         self.llm = llm
 
-    def generate_patch(self, issue_text,file_path, context):
-        system_prompt = "You are a senior software engineer. Generate minimal, correct code patches."
+    def rewrite_file(self, issue_text, file_path, context):
+
+        system_prompt = """
+You are a senior software engineer.
+
+You will receive:
+- A GitHub issue
+- A file path
+- The full content of the file
+
+You must return the FULL updated file content.
+
+Rules:
+- Return ONLY valid TypeScript code.
+- Do NOT include explanations.
+- Do NOT include markdown.
+- Do NOT include triple backticks.
+- Return the entire file from top to bottom.
+"""
 
         user_prompt = f"""
 GitHub Issue:
 {issue_text}
 
-You are ONLY allowed to modify this file:
+File to modify:
 {file_path}
 
-Here is the file content:
+Current file content:
 {context}
 
-Generate a minimal unified diff patch.
-
-The diff MUST modify:
-{file_path}
-
-Do NOT reference any other file.
-
-Return ONLY the diff.
+Return the FULL updated file content.
 """
-
-
 
         return self.llm.generate(system_prompt, user_prompt)

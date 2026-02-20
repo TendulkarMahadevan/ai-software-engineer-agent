@@ -1,48 +1,43 @@
+import os
+
 class RepoSearchTool:
 
-    def __init__(self, github_tool):
-        self.github = github_tool
+    def search_files_local(self, local_path, keywords):
+        matched = []
 
-    def search_files(self, repo_tree, keywords):
+        for root, _, files in os.walk(local_path):
+            for file in files:
+                if not file.endswith((".ts", ".js", ".py")):
+                    continue
 
-        file_scores = []
+                full_path = os.path.join(root, file)
+                relative_path = os.path.relpath(full_path, local_path)
+                lower_path = relative_path.lower()
 
-        # Stage 1: Path-level prefilter
-        candidate_files = []
+                path_score = 0
+                content_score = 0
 
-        for item in repo_tree:
-            if item["type"] != "blob":
-                continue
-
-            path = item["path"]
-
-            if not path.endswith((".py", ".ts", ".js", ".json", ".go", ".java", ".tsx")):
-                continue
-
-            for kw in keywords:
-                if kw.lower() in path.lower():
-                    candidate_files.append(item)
-                    break
-                # print(f"[SEARCH] Candidate files: {len(candidate_files)}")
-
-        # Stage 2: Content scoring (only for filtered files)
-        for item in candidate_files:
-
-            try:
-                file_content = self.github.get_file_content(item["url"])
-
-                score = 0
+                # ---- PATH-BASED SCORING (STRONG SIGNAL) ----
                 for kw in keywords:
-                    if kw.lower() in file_content.lower():
-                        score += 1
+                    if kw.lower() in lower_path:
+                        path_score += 3
 
-                if score > 0:
-                    file_scores.append((item["path"], score))
-                print(f"[SEARCH] Checking: {item['path']}")
+                # ---- CONTENT-BASED SCORING ----
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().lower()
+                        for kw in keywords:
+                            if kw.lower() in content:
+                                content_score += 1
+                except:
+                    pass
 
-            except Exception:
-                continue
+                total_score = path_score + content_score
 
-        file_scores.sort(key=lambda x: x[1], reverse=True)
+                if total_score > 0:
+                    matched.append((relative_path, total_score))
 
-        return [file[0] for file in file_scores[:5]]
+        # Sort by score (descending)
+        matched.sort(key=lambda x: x[1], reverse=True)
+
+        return [m[0] for m in matched]
