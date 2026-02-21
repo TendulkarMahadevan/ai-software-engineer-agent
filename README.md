@@ -59,6 +59,10 @@ openai_client.py
 
 ---
 
+### LLM Integration
+
+The agent integrates with large language models via API (currently using OpenAI), abstracted through a dedicated LLM client layer to allow future model portability.
+
 ## Key Features
 
 ### 1️⃣ Baseline Test Detection
