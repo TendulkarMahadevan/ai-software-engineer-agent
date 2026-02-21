@@ -59,7 +59,7 @@ openai_client.py
 
 ---
 
-## 🧠 Key Features
+## Key Features
 
 ### 1️⃣ Baseline Test Detection
 
@@ -245,5 +245,3 @@ SOFTWARE.
 
 
 ```
-
----
