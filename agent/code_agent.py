@@ -56,6 +56,26 @@ class CodeAgent:
         # ---- CREATE BRANCH EARLY ----
         branch_name = f"ai-fix-issue-{issue_number}"
         self.git_manager.create_branch(local_path, branch_name)
+        
+        # ---- RUN BASELINE TESTS BEFORE ANY MODIFICATION ----
+        print("[AI-ENGINEER] Running baseline tests before modification...")
+        baseline_test = TestRunner.run_tests(local_path)
+
+        baseline_output = (
+            baseline_test.get("stdout", "") +
+            "\n\nSTDERR:\n" +
+            baseline_test.get("stderr", "")
+        )
+
+        if baseline_test["returncode"] != 0:
+            print("[AI-ENGINEER] Baseline tests are already failing.")
+            print("\n===== BASELINE TEST OUTPUT =====\n")
+            print(baseline_output[:2000])
+            print("\n===============================\n")
+
+        else:
+            print("[AI-ENGINEER] Baseline tests passed.")
+
 
         # ---- KEYWORD EXTRACTION ----
         print("[AI-ENGINEER] Extracting keywords from issue...")
@@ -181,17 +201,20 @@ class CodeAgent:
         GitHub Issue:
         {issue_text}
 
-        File to modify:
+        Current failing test output (before modification):
+        {baseline_output}
+
+        Target file:
         {target_file}
 
-        Current file content:
+        Target file content:
         {file_content}
 
-        Additional related context (read-only, do NOT modify these directly):
-        {related_context}
-
-        Return the FULL updated file content of ONLY:
-        {target_file}
+        Identify the root cause of the failing tests.
+        Fix the issue with minimal changes.
+        Return ONLY the modified code block.
+        Do NOT return the entire file.
+        Do NOT include explanations.
         """
 
         new_content = self.llm.generate(system_prompt, user_prompt)
