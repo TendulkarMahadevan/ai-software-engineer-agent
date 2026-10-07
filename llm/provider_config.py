@@ -32,6 +32,7 @@ class LLMConfig:
     base_url: str
     model: str
     api_key: str = ""
+    source: str = "saved"  # saved | environment | legacy (OPENAI_API_KEY); never written to disk
 
     @property
     def is_ollama(self):
@@ -135,7 +136,9 @@ def save_config(cfg):
 
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2)
+        data = asdict(cfg)
+        data.pop("source", None)
+        json.dump(data, f, indent=2)
 
     os.replace(tmp_path, final_path)
     return final_path
@@ -168,9 +171,11 @@ def resolve():
             raise ConfigError("LLM_BASE_URL is set but LLM_MODEL is not. Set both.")
 
         api_key = env_key or (saved.api_key if saved else "")
-        return LLMConfig("env", base_url, model, api_key)
+        return LLMConfig("env", base_url, model, api_key, source="environment")
 
     if saved:
+        if saved.provider == "openai" and not saved.api_key:
+            saved.api_key = os.getenv("OPENAI_API_KEY", "").strip()
         return saved
 
     legacy_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -180,18 +185,35 @@ def resolve():
             PROVIDERS["openai"]["base_url"],
             PROVIDERS["openai"]["model"],
             legacy_key,
+            source="legacy",
         )
 
     return None
 
 
-def ensure_configured():
-    """Returns a config, running the setup menu on first use when a human is present."""
+def ensure_configured(input_fn=input):
+    """
+    Returns a config. Runs the setup menu on first use when a human is present.
+
+    If the only thing configured is an OPENAI_API_KEY (the old way), a person is asked
+    once whether to keep using it or pick another provider, so the menu is never hidden.
+    """
     cfg = resolve()
+    interactive = sys.stdin.isatty()
+
+    if cfg and cfg.source == "legacy" and interactive:
+        print(f"Found OPENAI_API_KEY. The agent can use OpenAI ({cfg.model}) with it.")
+        answer = input_fn("Press Enter to use it, or type s to choose another provider: ").strip().lower()
+        if answer in ("s", "setup"):
+            return run_setup()
+        # Remember the choice; the key itself stays in .env / the environment
+        save_config(LLMConfig("openai", cfg.base_url, cfg.model, ""))
+        return resolve()
+
     if cfg:
         return cfg
 
-    if not sys.stdin.isatty():
+    if not interactive:
         raise ConfigError(
             "No LLM configured. Run `python main.py --setup`, or set "
             "LLM_BASE_URL, LLM_MODEL and LLM_API_KEY in the environment."
@@ -199,6 +221,16 @@ def ensure_configured():
 
     print("First run: let's choose how the agent should think.\n")
     return run_setup()
+
+
+def describe(cfg):
+    """One line telling the user which provider is active and where that came from."""
+    origin = {
+        "environment": "from LLM_* environment variables",
+        "legacy": "from OPENAI_API_KEY",
+        "saved": f"saved in {config_path()}",
+    }.get(cfg.source, cfg.source)
+    return f"Using {cfg.provider} / {cfg.model} ({origin}). Change it with: python main.py --setup"
 
 
 # ---------- connection check ----------

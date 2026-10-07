@@ -41,11 +41,27 @@ def is_test_file(path):
     return False
 
 
+def _definition_pattern(name):
+    """
+    Matches a line that defines `name` (constant, variable, function, class, type),
+    not one that merely uses it. Works across common languages.
+    """
+    modifiers = (r"(?:(?:export|public|private|protected|static|final|readonly|async|pub|"
+                 r"const|let|var|val|def|class|function|func|fn|type|interface|struct|enum|"
+                 r"object|trait)\s+)*")
+    receiver = r"(?:\([^)]*\)\s*)?"  # Go method receiver: func (s *S) name()
+    return re.compile(rf"^\s*{modifiers}{receiver}{re.escape(name)}\s*(?::[^=\n]*)?(?:=(?!=)|\(|\{{|<|$|:)")
+
+
+ROOT_DEFINITION_SCORE = 10     # defines the name from scratch
+PARENT_BONUS = 5               # the file whose class others extend or qualify with
+DERIVED_DEFINITION_SCORE = 4   # redefines it from the parent's value (e.g. `X = Base.X | {...}`)
+
+
 class RepoSearchTool:
 
-    def search_files_local(self, local_path, keywords):
-        matched = []
-
+    def _source_files(self, local_path):
+        """Yields (full_path, relative_path) for every searchable source file."""
         for root, dirs, files in os.walk(local_path):
             # Prune in place so os.walk never descends into ignored folders
             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -62,31 +78,87 @@ class RepoSearchTool:
                 except OSError:
                     continue
 
-                relative_path = os.path.relpath(full_path, local_path)
-                lower_path = relative_path.lower()
+                yield full_path, os.path.relpath(full_path, local_path)
 
-                path_score = 0
-                content_score = 0
+    def find_definitions(self, local_path, identifiers):
+        """
+        Returns {relative_path: score} for files that DEFINE any of the identifiers.
 
-                # ---- PATH-BASED SCORING (STRONG SIGNAL) ----
-                for kw in keywords:
-                    if kw.lower() in lower_path:
-                        path_score += 3
+        - A definition built from the parent's value (the name appears again on the same
+          line, like `X = Base.X | {...}`) scores lower than an original definition.
+        - Several files can define the name from scratch (a base class and one-off
+          overrides). The one whose class is used as a qualifier elsewhere (`Base.X`)
+          is the parent, so it gets a bonus and wins the tie.
+        """
+        patterns = {name: _definition_pattern(name) for name in identifiers}
+        qualifier_res = [re.compile(rf"\b(\w+)\.{re.escape(name)}\b") for name in identifiers]
+        class_re = re.compile(r"^\s*(?:export\s+|public\s+|abstract\s+|final\s+)*"
+                              r"(?:class|struct|trait|interface|object)\s+(\w+)")
 
-                # ---- CONTENT-BASED SCORING ----
-                try:
-                    with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read().lower()
-                        for kw in keywords:
-                            if kw.lower() in content:
-                                content_score += 1
-                except OSError:
-                    pass
+        best_by_file = {}
+        classes_by_file = {}
+        qualifiers = set()
 
-                total_score = path_score + content_score
+        for full_path, relative_path in self._source_files(local_path):
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
 
-                if total_score > 0:
-                    matched.append((relative_path, total_score))
+            best = 0
+            classes = set()
+            for line in lines:
+                if any(name in line for name in identifiers):
+                    for qualifier_re in qualifier_res:
+                        qualifiers.update(qualifier_re.findall(line))
+                    for name, pattern in patterns.items():
+                        if name in line and pattern.match(line):
+                            derived = name in line.split(name, 1)[1]
+                            best = max(best, DERIVED_DEFINITION_SCORE if derived
+                                       else ROOT_DEFINITION_SCORE)
+                match = class_re.match(line)
+                if match:
+                    classes.add(match.group(1))
+
+            if best:
+                best_by_file[relative_path] = best
+                classes_by_file[relative_path] = classes
+
+        scores = {}
+        for path, best in best_by_file.items():
+            is_parent = bool(classes_by_file[path] & qualifiers)
+            scores[path] = best + (PARENT_BONUS if is_parent else 0)
+        return scores
+
+    def search_files_local(self, local_path, keywords):
+        matched = []
+
+        for full_path, relative_path in self._source_files(local_path):
+            lower_path = relative_path.lower()
+
+            path_score = 0
+            content_score = 0
+
+            # ---- PATH-BASED SCORING (STRONG SIGNAL) ----
+            for kw in keywords:
+                if kw.lower() in lower_path:
+                    path_score += 3
+
+            # ---- CONTENT-BASED SCORING ----
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().lower()
+                    for kw in keywords:
+                        if kw.lower() in content:
+                            content_score += 1
+            except OSError:
+                pass
+
+            total_score = path_score + content_score
+
+            if total_score > 0:
+                matched.append((relative_path, total_score))
 
         # Sort by score (descending)
         matched.sort(key=lambda x: x[1], reverse=True)

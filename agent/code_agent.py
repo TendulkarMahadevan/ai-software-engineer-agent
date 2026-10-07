@@ -7,7 +7,7 @@ from patch.pr_writer import PRWriter
 from llm.openai_client import LLMClient
 from utils.git_manager import GitManager
 from agent.keyword_extractor import KeywordExtractor
-from utils.test_runner import TestRunner
+from utils.test_runner import TestRunner, ENV_ERRORS
 
 class CodeAgent:
 
@@ -69,6 +69,7 @@ class CodeAgent:
         )
 
         baseline_status = baseline_test.get("status", "failed")
+        tests_unrunnable = baseline_status in ENV_ERRORS
         print(f"[AI-ENGINEER] Test runner: {baseline_test.get('runner', 'unknown')}")
 
         if baseline_status == "passed":
@@ -78,8 +79,10 @@ class CodeAgent:
             print("[AI-ENGINEER] No tests detected for this repo. "
                   "Continuing without test validation.")
 
-        elif baseline_status in ("tool_missing", "timeout", "error"):
-            print(f"[AI-ENGINEER] Could not run baseline tests ({baseline_status}).")
+        elif baseline_status in ENV_ERRORS:
+            print(f"[AI-ENGINEER] Could not run baseline tests ({baseline_status}). "
+                  "This is a setup problem, not a failing test. "
+                  "The patch will not be validated and no PR text will be written.")
             print(baseline_output[:2000])
 
         else:
@@ -131,7 +134,24 @@ class CodeAgent:
 
             return score
 
-        ranked_files = sorted(non_test_files, key=score_file, reverse=True)
+        # Files that DEFINE an identifier named in the issue (a constant, class or
+        # function) are the best patch targets, even if keyword search ranked them low.
+        identifiers = self.keyword_extractor.extract_identifiers(issue_text)
+        definitions = self.search.find_definitions(local_path, identifiers) if identifiers else {}
+        if definitions:
+            print(f"[AI-ENGINEER] Identifiers from issue: {identifiers}")
+            print(f"[AI-ENGINEER] Defined in: {sorted(definitions, key=definitions.get, reverse=True)[:5]}")
+
+        candidates = list(non_test_files)
+        for path in definitions:
+            if path not in candidates and not is_test_file(path):
+                candidates.append(path)
+
+        ranked_files = sorted(
+            candidates,
+            key=lambda path: (definitions.get(path, 0), score_file(path)),
+            reverse=True,
+        )
 
         if not ranked_files:
             print("No candidate files after ranking.")
@@ -144,7 +164,7 @@ class CodeAgent:
         # ---- SELECT RELATED FILES FOR CONTEXT (Mini-RAG) ----
         related_files = []
 
-        for f in files:
+        for f in ranked_files:
             if f != target_file and not is_test_file(f):
                 related_files.append(f)
 
@@ -242,12 +262,36 @@ class CodeAgent:
         print(diff_output)
         
         # ---- RUN TESTS ----
-        print("[AI-ENGINEER] Running automated tests...")
-        test_result = TestRunner.run_tests(local_path)
+        if tests_unrunnable:
+            # Same setup problem as the baseline: running again would only repeat it
+            print("[AI-ENGINEER] Skipping tests and retry: the test setup is broken "
+                  "(see the baseline error above).")
+            test_result = baseline_test
+            test_status = "Tests could not be run (setup problem); patch is not validated."
+        else:
+            print("[AI-ENGINEER] Running automated tests...")
+            test_result = TestRunner.run_tests(local_path)
 
-        if test_result["returncode"] == 0:
+        post_status = test_result.get("status", "failed")
+
+        if tests_unrunnable:
+            pass
+
+        elif post_status == "passed":
             print("[AI-ENGINEER] Tests passed ✅")
             test_status = "Tests passed successfully."
+
+        elif post_status == "no_tests_found":
+            print("[AI-ENGINEER] No tests detected, so the patch is not validated.")
+            test_status = "No tests detected; patch is not validated."
+
+        elif post_status in ENV_ERRORS:
+            print(f"[AI-ENGINEER] Could not run tests after the change ({post_status}). "
+                  "No retry and no PR text.")
+            print(test_result["stderr"][-1500:])
+            test_status = "Tests could not be run; patch is not validated."
+            tests_unrunnable = True
+
         else:
             print("[AI-ENGINEER] Tests failed ❌")
             test_status = "Tests failed. Attempting automatic retry..."
@@ -296,15 +340,24 @@ class CodeAgent:
                 print("[AI-ENGINEER] Re-running tests after retry...")
                 test_result = TestRunner.run_tests(local_path)
 
-                if test_result["returncode"] == 0:
+                if test_result.get("status") == "passed":
                     print("[AI-ENGINEER] Tests passed after retry ✅")
                     test_status = "Tests passed after automatic retry."
+                elif test_result.get("status") in ENV_ERRORS:
+                    print("[AI-ENGINEER] Tests could not be run after the retry.")
+                    test_status = "Tests could not be run; patch is not validated."
+                    tests_unrunnable = True
                 else:
                     print("[AI-ENGINEER] Tests still failing ❌")
                     test_status = "Tests failed even after retry."
 
 
         print(test_result["stdout"])
+
+        if tests_unrunnable:
+            print("[AI-ENGINEER] Review the diff above by hand. Not generating PR text "
+                  "for a patch that could not be tested.")
+            return
 
         
         if len(diff_output.splitlines()) < 5:

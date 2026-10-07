@@ -229,5 +229,50 @@ class ConnectionCheckTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class LegacyKeyPromptTests(ConfigTestCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["OPENAI_API_KEY"] = "sk-env"
+
+    def ensure(self, answer, tty=True):
+        with mock.patch("sys.stdin.isatty", return_value=tty):
+            return pc.ensure_configured(input_fn=lambda prompt="": answer)
+
+    def test_enter_keeps_openai_and_remembers_without_copying_key(self):
+        cfg = self.ensure("")
+        self.assertEqual((cfg.provider, cfg.api_key, cfg.source), ("openai", "sk-env", "saved"))
+        self.assertEqual(pc.load_saved().api_key, "")  # key stays in the environment
+
+    def test_choice_is_remembered_so_second_run_does_not_ask(self):
+        self.ensure("")
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            cfg = pc.ensure_configured(input_fn=lambda prompt="": self.fail("asked again"))
+        self.assertEqual(cfg.provider, "openai")
+
+    def test_s_opens_setup_menu(self):
+        with mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch.object(pc, "run_setup", return_value="MENU") as menu:
+            result = pc.ensure_configured(input_fn=lambda prompt="": "s")
+        self.assertEqual(result, "MENU")
+        menu.assert_called_once()
+
+    def test_non_interactive_uses_legacy_key_silently(self):
+        cfg = self.ensure("", tty=False)
+        self.assertEqual((cfg.provider, cfg.source), ("openai", "legacy"))
+        self.assertIsNone(pc.load_saved())
+
+    def test_source_is_never_written_to_disk(self):
+        path = pc.save_config(pc.LLMConfig("openai", "https://x/v1", "m", "", source="legacy"))
+        with open(path) as f:
+            self.assertNotIn("source", f.read())
+
+    def test_describe_names_provider_model_and_origin(self):
+        self.assertIn("OPENAI_API_KEY", pc.describe(pc.resolve()))
+        os.environ["LLM_MODEL"] = "m9"
+        text = pc.describe(pc.resolve())
+        self.assertIn("m9", text)
+        self.assertIn("--setup", text)
+
+
 if __name__ == "__main__":
     unittest.main()

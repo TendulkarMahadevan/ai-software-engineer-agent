@@ -17,7 +17,8 @@ def main():
         if args.setup:
             provider_config.run_setup()
             return
-        provider_config.ensure_configured()
+        cfg = provider_config.ensure_configured()
+        print(f"[AI-ENGINEER] {provider_config.describe(cfg)}")
     except provider_config.ConfigError as e:
         print(e)
         sys.exit(1)

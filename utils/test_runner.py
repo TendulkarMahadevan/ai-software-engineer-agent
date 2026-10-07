@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -14,6 +15,31 @@ NO_TESTS = "no_tests_found"
 TOOL_MISSING = "tool_missing"
 TIMEOUT = "timeout"
 ERROR = "error"
+
+# Statuses that mean "the tests could not be run", as opposed to "the tests failed".
+# Callers should not retry a fix or write a PR on these.
+ENV_ERRORS = (TOOL_MISSING, TIMEOUT, ERROR)
+
+# Kept out of the commits the agent makes (written to .git/info/exclude)
+LOCAL_ONLY = (".ai_agent_venv/", ".ai_agent_installed")
+INSTALL_MARKER = ".ai_agent_installed"
+
+# Optional-dependency groups that usually hold test tooling, in order of preference
+PREFERRED_EXTRAS = ("test", "tests", "testing", "dev")
+DEV_REQUIREMENT_FILES = ("requirements-dev.txt", "requirements-test.txt", "dev-requirements.txt")
+
+PYTEST_NAME = "python (pytest)"
+# pytest exit codes: 3 = internal error, 4 = usage error (bad flag, missing plugin),
+# 5 = no tests collected. 3 and 4 are setup problems, not failing tests.
+PYTEST_NO_TESTS = 5
+PYTEST_SETUP_ERRORS = (3, 4)
+
+# addopts fragments that need a plugin, so the repo's own pytest config can load
+PYTEST_PLUGIN_HINTS = (
+    (re.compile(r"--cov\b"), "pytest-cov"),
+    (re.compile(r"(^|\s)-n\s*(\d+|auto|logical)\b|--numprocesses\b"), "pytest-xdist"),
+    (re.compile(r"--timeout\b"), "pytest-timeout"),
+)
 
 
 class TestRunner:
@@ -47,20 +73,31 @@ class TestRunner:
         runner_name, install_cmds, test_cmd, env = plan
         print(f"[TEST-RUNNER] Detected runner: {runner_name}")
 
+        TestRunner._exclude_from_git(repo_path)
+
         out_log, err_log = "", ""
 
-        # ---- install dependencies ----
-        for cmd in install_cmds:
-            print(f"[TEST-RUNNER] Installing: {' '.join(cmd)}")
-            res = TestRunner._run(cmd, repo_path, env, INSTALL_TIMEOUT)
-            out_log += res["stdout"]
-            err_log += res["stderr"]
-            if res["status"] != PASSED:
-                err_log += f"\n[TEST-RUNNER] Install step failed: {' '.join(cmd)}\n"
-                return TestRunner._result(
-                    res["returncode"] or -1, out_log, err_log,
-                    res["status"], runner_name,
-                )
+        # ---- install dependencies (once per clone) ----
+        marker = os.path.join(repo_path, INSTALL_MARKER)
+        fingerprint = json.dumps(install_cmds)
+
+        if install_cmds and TestRunner._read(marker) == fingerprint:
+            print("[TEST-RUNNER] Dependencies already installed, skipping install.")
+        else:
+            for cmd in install_cmds:
+                print(f"[TEST-RUNNER] Installing: {' '.join(cmd)}")
+                res = TestRunner._run(cmd, repo_path, env, INSTALL_TIMEOUT)
+                out_log += res["stdout"]
+                err_log += res["stderr"]
+                if res["status"] != PASSED:
+                    err_log += f"\n[TEST-RUNNER] Install step failed: {' '.join(cmd)}\n"
+                    # A failed install is a setup problem even when the command exited nonzero
+                    status = res["status"] if res["status"] != FAILED else ERROR
+                    return TestRunner._result(
+                        res["returncode"] or -1, out_log, err_log, status, runner_name,
+                    )
+            if install_cmds:
+                TestRunner._write(marker, fingerprint)
 
         # ---- run tests ----
         print(f"[TEST-RUNNER] Running: {' '.join(test_cmd)}")
@@ -70,9 +107,13 @@ class TestRunner:
 
         status = res["status"]
 
-        # pytest exits with code 5 when it collects zero tests
-        if runner_name == "python (pytest)" and res["returncode"] == 5:
-            status = NO_TESTS
+        if runner_name == PYTEST_NAME:
+            if res["returncode"] == PYTEST_NO_TESTS:
+                status = NO_TESTS
+            elif res["returncode"] in PYTEST_SETUP_ERRORS:
+                status = ERROR
+                err_log += ("\n[TEST-RUNNER] pytest could not start (usage or internal error). "
+                            "This is a setup problem, not a failing test.\n")
 
         returncode = 0 if status == PASSED else (res["returncode"] or -1)
         return TestRunner._result(returncode, out_log, err_log, status, runner_name)
@@ -83,6 +124,7 @@ class TestRunner:
     def _build_plan(repo_path, config):
         """Returns (runner_name, [install_cmds], test_cmd, env) or None."""
         env = os.environ.copy()
+        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
 
         # 1. explicit override from the target repo
         if config.get("test_command"):
@@ -145,25 +187,88 @@ class TestRunner:
         venv_dir = os.path.join(repo_path, ".ai_agent_venv")
         bin_dir = "Scripts" if sys.platform == "win32" else "bin"
         venv_python = os.path.join(venv_dir, bin_dir, "python")
+        pip = [venv_python, "-m", "pip", "install", "-q"]
 
-        install_cmds = [[sys.executable, "-m", "venv", venv_dir]]
-        install_cmds.append([venv_python, "-m", "pip", "install", "-q", "pytest"])
+        install_cmds = []
+        if not os.path.exists(venv_python):
+            install_cmds.append([sys.executable, "-m", "venv", venv_dir])
 
+        # pytest itself, plus any plugin the repo's own pytest config requires
+        install_cmds.append(pip + ["pytest"] + TestRunner._required_pytest_plugins(repo_path))
+
+        for req_file in DEV_REQUIREMENT_FILES:
+            if has(req_file):
+                install_cmds.append(pip + ["-r", req_file])
         if has("requirements.txt"):
-            install_cmds.append(
-                [venv_python, "-m", "pip", "install", "-q", "-r", "requirements.txt"]
-            )
+            install_cmds.append(pip + ["-r", "requirements.txt"])
+
         if has("pyproject.toml") or has("setup.py") or has("setup.cfg"):
-            install_cmds.append(
-                [venv_python, "-m", "pip", "install", "-q", "-e", "."]
-            )
+            extra = TestRunner._test_extra(repo_path)
+            target = f".[{extra}]" if extra else "."
+            install_cmds.append(pip + ["-e", target])
 
         return (
-            "python (pytest)",
+            PYTEST_NAME,
             install_cmds,
             [venv_python, "-m", "pytest", "-x", "-q"],
             env,
         )
+
+    # ---------- python config helpers ----------
+
+    @staticmethod
+    def _test_extra(repo_path):
+        """Name of the optional-dependency group holding test tooling, or None."""
+        extras = TestRunner._optional_dependency_groups(repo_path)
+        for name in PREFERRED_EXTRAS:
+            if name in extras:
+                return name
+        return None
+
+    @staticmethod
+    def _optional_dependency_groups(repo_path):
+        path = os.path.join(repo_path, "pyproject.toml")
+        text = TestRunner._read(path)
+        if not text:
+            return set()
+
+        try:
+            import tomllib  # Python 3.11+
+            data = tomllib.loads(text)
+            return set(data.get("project", {}).get("optional-dependencies", {}))
+        except ImportError:
+            pass
+        except Exception:
+            return set()
+
+        # Fallback for Python < 3.11: read the keys of [project.optional-dependencies]
+        names, inside = set(), False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                inside = stripped == "[project.optional-dependencies]"
+                continue
+            if inside:
+                match = re.match(r'^"?([A-Za-z0-9_.-]+)"?\s*=', stripped)
+                if match:
+                    names.add(match.group(1))
+        return names
+
+    @staticmethod
+    def _required_pytest_plugins(repo_path):
+        """Plugins implied by addopts in the repo's pytest config (empty if none)."""
+        addopts = []
+        for name in ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"):
+            for line in TestRunner._read(os.path.join(repo_path, name)).splitlines():
+                if "addopts" in line:
+                    addopts.append(line)
+        joined = " ".join(addopts)
+
+        plugins = []
+        for pattern, plugin in PYTEST_PLUGIN_HINTS:
+            if pattern.search(joined) and plugin not in plugins:
+                plugins.append(plugin)
+        return plugins
 
     # ---------- helpers ----------
 
@@ -209,6 +314,35 @@ class TestRunner:
         except Exception:
             pass
         return config
+
+    @staticmethod
+    def _read(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _write(path, text):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _exclude_from_git(repo_path):
+        """Keeps the venv and install marker out of the agent's commits."""
+        info_dir = os.path.join(repo_path, ".git", "info")
+        if not os.path.isdir(info_dir):
+            return
+        exclude = os.path.join(info_dir, "exclude")
+        existing = TestRunner._read(exclude)
+        missing = [entry for entry in LOCAL_ONLY if entry not in existing.splitlines()]
+        if missing:
+            prefix = "" if not existing or existing.endswith("\n") else "\n"
+            TestRunner._write(exclude, existing + prefix + "\n".join(missing) + "\n")
 
     @staticmethod
     def _run(cmd, cwd, env, timeout):
