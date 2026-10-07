@@ -198,6 +198,38 @@ This agent prioritizes:
 
 ---
 
+## 🧠 Choosing an AI Provider
+
+No paid key is required. On first run the agent asks how you want it to think:
+
+```
+  1) Free, on my computer (Ollama: no key, no account)
+  2) Free hosted tier (free key, rate limited)
+  3) My own paid key (best quality)
+```
+
+Change your mind any time with:
+
+```bash
+python main.py --setup
+```
+
+If a call fails mid-run (Ollama not running, bad key, rate limit), the agent offers the same menu so you can switch and continue.
+
+Any OpenAI-compatible endpoint works. For scripts and CI, skip the menu with environment variables:
+
+```bash
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen2.5-coder:7b
+LLM_API_KEY=            # not needed for local models
+```
+
+Your choice is saved in `~/.config/ai-engineer-agent/config.json` (owner-only permissions). Free-tier limits and default model names change often, so check your provider's current docs. Small local models are less reliable at precise code edits than hosted ones.
+
+Run the tests with `python -m unittest discover -s tests -t .`
+
+---
+
 ## 🧪 Running the Agent
 
 ```bash
