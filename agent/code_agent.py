@@ -1,6 +1,7 @@
 import os
+import re
 from tools.github_tool import GitHubTool
-from tools.repo_search_tool import RepoSearchTool
+from tools.repo_search_tool import RepoSearchTool, is_test_file
 from tools.context_extractor import ContextExtractor
 from patch.pr_writer import PRWriter
 from llm.openai_client import LLMClient
@@ -67,14 +68,25 @@ class CodeAgent:
             baseline_test.get("stderr", "")
         )
 
-        if baseline_test["returncode"] != 0:
+        baseline_status = baseline_test.get("status", "failed")
+        print(f"[AI-ENGINEER] Test runner: {baseline_test.get('runner', 'unknown')}")
+
+        if baseline_status == "passed":
+            print("[AI-ENGINEER] Baseline tests passed.")
+
+        elif baseline_status == "no_tests_found":
+            print("[AI-ENGINEER] No tests detected for this repo. "
+                  "Continuing without test validation.")
+
+        elif baseline_status in ("tool_missing", "timeout", "error"):
+            print(f"[AI-ENGINEER] Could not run baseline tests ({baseline_status}).")
+            print(baseline_output[:2000])
+
+        else:
             print("[AI-ENGINEER] Baseline tests are already failing.")
             print("\n===== BASELINE TEST OUTPUT =====\n")
             print(baseline_output[:2000])
             print("\n===============================\n")
-
-        else:
-            print("[AI-ENGINEER] Baseline tests passed.")
 
 
         # ---- KEYWORD EXTRACTION ----
@@ -91,32 +103,22 @@ class CodeAgent:
             return
 
         # ---- FILTER OUT TEST FILES ----
-        non_test_files = [f for f in files if ".test." not in f]
+        non_test_files = [f for f in files if not is_test_file(f)]
 
         if not non_test_files:
             non_test_files = files  # fallback
 
         # ---- FILE SCORING ----
+        # The search step already ranks by keyword relevance, and sorted() is
+        # stable, so this only demotes files that are poor patch targets.
+        # No repo-specific heuristics here: it must work on any codebase.
         def score_file(path):
             score = 0
             lower = path.lower()
 
-            # Boost inbound-related signals
-            if any(x in lower for x in ["gateway", "raw", "update", "poll", "dispatch", "handler", "listener"]):
-                score += 6
-
-            # Penalize outbound-focused signals
-            if any(x in lower for x in ["send", "outbound", "publisher", "notify"]):
-                score -= 3
-                
-             # Dynamic Boost Based on Issue Analysis
-            if "inbound" in issue_analysis.lower():
-                if any(x in lower for x in ["handler", "listener", "dispatch", "poll"]):
-                    score += 5
-
-            if "database" in issue_analysis.lower():
-                if any(x in lower for x in ["repository", "model", "db"]):
-                    score += 5
+            # Penalize generated / minified / config-like files
+            if any(x in lower for x in [".min.", ".generated.", ".pb.", "_pb2", "migrations/"]):
+                score -= 5
 
             # Penalize very large files
             try:
@@ -124,7 +126,7 @@ class CodeAgent:
                 size = os.path.getsize(full_path)
                 if size > 50000:
                     score -= 5
-            except:
+            except OSError:
                 pass
 
             return score
@@ -143,7 +145,7 @@ class CodeAgent:
         related_files = []
 
         for f in files:
-            if f != target_file and ".test." not in f:
+            if f != target_file and not is_test_file(f):
                 related_files.append(f)
 
         # Take top 2 related files max
@@ -210,14 +212,21 @@ class CodeAgent:
         Target file content:
         {file_content}
 
-        Identify the root cause of the failing tests.
-        Fix the issue with minimal changes.
-        Return ONLY the modified code block.
-        Do NOT return the entire file.
-        Do NOT include explanations.
+        Identify the root cause of the issue.
+        Fix it with minimal changes.
+        Return the COMPLETE updated file, from the first line to the last,
+        with every unchanged line kept exactly as it is.
+        Do NOT return only a snippet, a diff, or a summary.
+        Do NOT include explanations or markdown fences.
         """
 
-        new_content = self.llm.generate(system_prompt, user_prompt)
+        raw_content = self.llm.generate(system_prompt, user_prompt)
+        new_content = self._clean_file_output(raw_content, file_content)
+
+        if new_content is None:
+            print("[AI-ENGINEER] LLM output rejected (empty, truncated or snippet-only). "
+                  "File left untouched.")
+            return
 
         # ---- OVERWRITE FILE ----
         self.git_manager.overwrite_file(local_path, target_file, new_content)
@@ -255,29 +264,44 @@ class CodeAgent:
 
             Test Failure Logs:
             {test_result["stdout"]}
+            {test_result["stderr"][-2000:]}
+
+            Target file: {target_file}
+
+            Current content of the target file (after the previous change):
+            {new_content}
 
             Fix the test errors WITHOUT removing unrelated logic.
             Make minimal changes.
-            Return only valid code.
+            Return the COMPLETE updated file, from the first line to the last,
+            with every unchanged line kept exactly as it is.
+            Do NOT return only a snippet, a diff, or a summary.
+            Do NOT include explanations or markdown fences.
             """
 
-            retry_content = self.llm.generate(
+            retry_raw = self.llm.generate(
                 "You are a senior engineer fixing failing tests.",
                 retry_prompt
             )
+            retry_content = self._clean_file_output(retry_raw, new_content)
 
-            self.git_manager.overwrite_file(local_path, target_file, retry_content)
-            self.git_manager.commit_changes(local_path, "Retry fix after test failure")
-
-            print("[AI-ENGINEER] Re-running tests after retry...")
-            test_result = TestRunner.run_tests(local_path)
-
-            if test_result["returncode"] == 0:
-                print("[AI-ENGINEER] Tests passed after retry ✅")
-                test_status = "Tests passed after automatic retry."
+            if retry_content is None:
+                print("[AI-ENGINEER] Retry output rejected (empty, truncated or snippet-only). "
+                      "Keeping the first attempt.")
+                test_status = "Tests failed; retry output was rejected."
             else:
-                print("[AI-ENGINEER] Tests still failing ❌")
-                test_status = "Tests failed even after retry."
+                self.git_manager.overwrite_file(local_path, target_file, retry_content)
+                self.git_manager.commit_changes(local_path, "Retry fix after test failure")
+
+                print("[AI-ENGINEER] Re-running tests after retry...")
+                test_result = TestRunner.run_tests(local_path)
+
+                if test_result["returncode"] == 0:
+                    print("[AI-ENGINEER] Tests passed after retry ✅")
+                    test_status = "Tests passed after automatic retry."
+                else:
+                    print("[AI-ENGINEER] Tests still failing ❌")
+                    test_status = "Tests failed even after retry."
 
 
         print(test_result["stdout"])
@@ -308,13 +332,27 @@ class CodeAgent:
             return
         
         # ---- FUNCTION DELETION GUARD ----
-        deleted_functions = [
-            line for line in change_lines
-            if line.startswith("-function") or line.startswith("-async function")
-        ]
+        # Language-agnostic: a definition is "deleted" only if its name was
+        # removed and never re-added (so editing a signature is allowed).
+        definition_re = re.compile(
+            r"^\s*(?:export\s+)?(?:public\s+|private\s+|protected\s+|static\s+|async\s+|pub\s+)*"
+            r"(?:def|function|func|fn|class|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)"
+        )
+
+        def definition_names(prefix):
+            names = set()
+            for line in change_lines:
+                if line.startswith(prefix):
+                    match = definition_re.match(line[1:])
+                    if match:
+                        names.add(match.group(1))
+            return names
+
+        deleted_functions = definition_names("-") - definition_names("+")
 
         if deleted_functions:
-            print("[AI-ENGINEER] Detected function deletion. Aborting unsafe modification.")
+            print(f"[AI-ENGINEER] Detected deletion of: {', '.join(sorted(deleted_functions))}. "
+                  "Aborting unsafe modification.")
             return
 
         # ---- PR DESCRIPTION ----
@@ -323,6 +361,39 @@ class CodeAgent:
 
         print("\n===== PR DESCRIPTION =====\n")
         print(pr)
+
+    def _clean_file_output(self, text, original):
+        """
+        Turns raw LLM output into file content, or returns None if it can't be trusted.
+
+        Handles: markdown fences around the whole answer, empty output, and
+        snippet-only / truncated answers (far shorter than the original file).
+        """
+        if not text or not text.strip():
+            return None
+
+        cleaned = text.strip()
+
+        fenced = re.match(r"^```[\w+.-]*\n(.*?)\n?```\s*$", cleaned, re.DOTALL)
+        if fenced:
+            cleaned = fenced.group(1)
+
+        # A stray fence line left inside means the model mixed prose and code
+        if cleaned.startswith("```") or cleaned.endswith("```"):
+            return None
+
+        original_lines = len(original.splitlines())
+        new_lines = len(cleaned.splitlines())
+
+        # Only enforce the length check when there is enough original to compare
+        if original_lines >= 20 and new_lines < original_lines * 0.5:
+            return None
+
+        # Keep the file's trailing newline convention
+        if original.endswith("\n") and not cleaned.endswith("\n"):
+            cleaned += "\n"
+
+        return cleaned
 
     def log(self, step):
         print(f"[AI-ENGINEER] {step}")
