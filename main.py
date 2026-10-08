@@ -11,6 +11,12 @@ def main():
         action="store_true",
         help="choose or change the AI provider (free local, free hosted, or your own key)",
     )
+    parser.add_argument(
+        "--trust-repo-config",
+        action="store_true",
+        help="let the target repo's .ai-agent.yml choose the install and test commands "
+             "(it can run any command on this machine; only use it for repos you trust)",
+    )
     args = parser.parse_args()
 
     try:
@@ -30,7 +36,7 @@ def main():
     repo = input("Repo Name: ")
     issue_number = int(input("Issue Number: "))
 
-    agent = CodeAgent()
+    agent = CodeAgent(trust_repo_config=args.trust_repo_config)
     agent.run(owner, repo, issue_number)
 
 

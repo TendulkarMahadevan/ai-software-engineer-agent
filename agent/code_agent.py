@@ -11,7 +11,9 @@ from utils.test_runner import TestRunner, ENV_ERRORS
 
 class CodeAgent:
 
-    def __init__(self):
+    def __init__(self, trust_repo_config=False):
+        # Whether the target repo's own .ai-agent.yml may set the commands we run
+        self.trust_repo_config = trust_repo_config
         self.github = GitHubTool()
         self.search = RepoSearchTool()
         self.extractor = ContextExtractor()
@@ -60,7 +62,7 @@ class CodeAgent:
         
         # ---- RUN BASELINE TESTS BEFORE ANY MODIFICATION ----
         print("[AI-ENGINEER] Running baseline tests before modification...")
-        baseline_test = TestRunner.run_tests(local_path)
+        baseline_test = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
         baseline_output = (
             baseline_test.get("stdout", "") +
@@ -270,7 +272,7 @@ class CodeAgent:
             test_status = "Tests could not be run (setup problem); patch is not validated."
         else:
             print("[AI-ENGINEER] Running automated tests...")
-            test_result = TestRunner.run_tests(local_path)
+            test_result = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
         post_status = test_result.get("status", "failed")
 
@@ -338,7 +340,7 @@ class CodeAgent:
                 self.git_manager.commit_changes(local_path, "Retry fix after test failure")
 
                 print("[AI-ENGINEER] Re-running tests after retry...")
-                test_result = TestRunner.run_tests(local_path)
+                test_result = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
                 if test_result.get("status") == "passed":
                     print("[AI-ENGINEER] Tests passed after retry ✅")

@@ -190,5 +190,80 @@ class DefinitionTests(unittest.TestCase):
         self.assertFalse(is_test_file("src/contest.go"))
 
 
+class SandboxHygieneTests(unittest.TestCase):
+    """Install/test commands run target-repo code on this machine: limit what they inherit."""
+
+    SECRETS = {"GITHUB_TOKEN": "gh-secret", "OPENAI_API_KEY": "sk-secret", "LLM_API_KEY": "llm-secret",
+               "AWS_SECRET_ACCESS_KEY": "aws-secret", "ANTHROPIC_API_KEY": "an-secret"}
+
+    def test_safe_env_drops_secrets_and_keeps_toolchain_vars(self):
+        source = dict(self.SECRETS, PATH="/usr/bin", HOME="/home/u", LC_ALL="C.UTF-8",
+                      CARGO_HOME="/c", HTTPS_PROXY="http://p:1")
+        env = TestRunner._safe_env(source)
+        for name in self.SECRETS:
+            self.assertNotIn(name, env)
+        for name in ("PATH", "HOME", "LC_ALL", "CARGO_HOME", "HTTPS_PROXY"):
+            self.assertIn(name, env)
+
+    def test_commands_never_receive_the_agents_secrets(self):
+        repo = make_repo({"pyproject.toml": "[project]\nname='x'\n"})
+        seen = []
+
+        def fake_run(cmd, cwd, env, timeout):
+            seen.append(env)
+            return {"returncode": 0, "stdout": "", "stderr": "", "status": tr.PASSED}
+
+        with mock.patch.dict(os.environ, self.SECRETS), \
+             mock.patch.object(TestRunner, "_run", side_effect=fake_run):
+            TestRunner.run_tests(repo)
+
+        self.assertGreater(len(seen), 1)  # install steps and the test command
+        for env in seen:
+            self.assertFalse(set(self.SECRETS) & set(env), env.keys())
+            self.assertIn("PATH", env)
+
+    def write_repo_config(self, command):
+        return make_repo({"pyproject.toml": "[project]\nname='x'\n",
+                          ".ai-agent.yml": f"test_command: {command}\ninstall_command: {command}\n"})
+
+    def run_recording(self, repo, **kwargs):
+        calls = []
+
+        def fake_run(cmd, cwd, env, timeout):
+            calls.append(cmd)
+            return {"returncode": 0, "stdout": "", "stderr": "", "status": tr.PASSED}
+
+        with mock.patch.object(TestRunner, "_run", side_effect=fake_run):
+            result = TestRunner.run_tests(repo, **kwargs)
+        return result, calls
+
+    def test_repo_config_is_ignored_by_default(self):
+        repo = self.write_repo_config("evilcmd")
+        result, calls = self.run_recording(repo)
+        self.assertFalse(any("evilcmd" in part for cmd in calls for part in cmd))
+        self.assertEqual(result["runner"], tr.PYTEST_NAME)
+
+    def test_ignored_config_is_announced(self):
+        repo = self.write_repo_config("evilcmd")
+        with mock.patch("builtins.print") as printed:
+            self.run_recording(repo)
+        text = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertIn("Ignoring .ai-agent.yml", text)
+        self.assertIn("--trust-repo-config", text)
+
+    def test_repo_config_used_only_when_trusted(self):
+        repo = self.write_repo_config("mycheck")
+        result, calls = self.run_recording(repo, trust_repo_config=True)
+        self.assertTrue(any(cmd[0] == "mycheck" for cmd in calls))
+        self.assertEqual(result["runner"], "custom (.ai-agent.yml)")
+
+    def test_no_config_file_prints_no_warning(self):
+        repo = make_repo({"pyproject.toml": "[project]\nname='x'\n"})
+        with mock.patch("builtins.print") as printed:
+            self.run_recording(repo)
+        text = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertNotIn("Ignoring", text)
+
+
 if __name__ == "__main__":
     unittest.main()

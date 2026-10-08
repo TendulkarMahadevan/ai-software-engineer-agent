@@ -230,6 +230,19 @@ Run the tests with `python -m unittest discover -s tests -t .`
 
 ---
 
+## 🔒 Security notice
+
+To check a fix, the agent installs the target repo's dependencies and runs its tests **on your machine**. That runs code written by whoever owns that repo, and there is no sandbox yet.
+
+What is protected today:
+
+* The repo's install and test commands do not receive your environment variables (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `LLM_API_KEY`, cloud credentials and similar are dropped).
+* A repo's own `.ai-agent.yml` is ignored, because it can choose any command. Use `--trust-repo-config` only for repos you trust.
+
+What is **not** protected: a hostile repo can still read files on your disk, including `~/.config/ai-engineer-agent/config.json`. Only point the agent at repos you trust, or run it inside a throwaway VM or container. A Docker sandbox is planned.
+
+---
+
 ## 🧪 Running the Agent
 
 ```bash

@@ -28,6 +28,25 @@ INSTALL_MARKER = ".ai_agent_installed"
 PREFERRED_EXTRAS = ("test", "tests", "testing", "dev")
 DEV_REQUIREMENT_FILES = ("requirements-dev.txt", "requirements-test.txt", "dev-requirements.txt")
 
+# Environment variables passed to the target repo's install and test commands.
+# Everything else (GITHUB_TOKEN, OPENAI_API_KEY, LLM_API_KEY, cloud credentials...)
+# is dropped, so a hostile install script cannot read the agent's secrets from its
+# environment. This does not stop a script from reading files on disk: only a
+# sandbox (Docker) does that.
+SAFE_ENV_NAMES = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM",
+    "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+    # toolchain locations
+    "JAVA_HOME", "GOPATH", "GOROOT", "GOCACHE", "GOMODCACHE", "CARGO_HOME",
+    "RUSTUP_HOME", "NVM_DIR", "VOLTA_HOME", "PYENV_ROOT", "ASDF_DIR",
+    # corporate proxy and certificate settings
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+})
+SAFE_ENV_PREFIXES = ("LC_",)
+
+REPO_CONFIG_NAME = ".ai-agent.yml"
+
 PYTEST_NAME = "python (pytest)"
 # pytest exit codes: 3 = internal error, 4 = usage error (bad flag, missing plugin),
 # 5 = no tests collected. 3 and 4 are setup problems, not failing tests.
@@ -59,8 +78,20 @@ class TestRunner:
     # ---------- public API ----------
 
     @staticmethod
-    def run_tests(repo_path):
-        config = TestRunner._load_config(repo_path)
+    def run_tests(repo_path, trust_repo_config=False):
+        """
+        Runs the target repo's tests.
+
+        The repo's own .ai-agent.yml can set arbitrary install and test commands, so
+        it is ignored unless the caller explicitly passes trust_repo_config=True.
+        """
+        if trust_repo_config:
+            config = TestRunner._load_config(repo_path)
+        else:
+            config = {}
+            if os.path.exists(os.path.join(repo_path, REPO_CONFIG_NAME)):
+                print(f"[TEST-RUNNER] Ignoring {REPO_CONFIG_NAME} in the target repo: it can "
+                      "run any command. Pass --trust-repo-config to use it.")
         plan = TestRunner._build_plan(repo_path, config)
 
         if plan is None:
@@ -123,7 +154,7 @@ class TestRunner:
     @staticmethod
     def _build_plan(repo_path, config):
         """Returns (runner_name, [install_cmds], test_cmd, env) or None."""
-        env = os.environ.copy()
+        env = TestRunner._safe_env()
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
 
         # 1. explicit override from the target repo
@@ -314,6 +345,15 @@ class TestRunner:
         except Exception:
             pass
         return config
+
+    @staticmethod
+    def _safe_env(source=None):
+        """A copy of the environment with only the allowlisted variables."""
+        source = os.environ if source is None else source
+        return {
+            name: value for name, value in source.items()
+            if name in SAFE_ENV_NAMES or name.startswith(SAFE_ENV_PREFIXES)
+        }
 
     @staticmethod
     def _read(path):
