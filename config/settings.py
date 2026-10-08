@@ -3,11 +3,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# The LLM provider and key are handled in llm/provider_config.py
+# (run `python main.py --setup`). Only GitHub access is required here.
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found in .env")
 
 if not GITHUB_TOKEN:
     raise ValueError("GITHUB_TOKEN not found in .env")

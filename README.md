@@ -198,6 +198,51 @@ This agent prioritizes:
 
 ---
 
+## 🧠 Choosing an AI Provider
+
+No paid key is required. On first run the agent asks how you want it to think:
+
+```
+  1) Free, on my computer (Ollama: no key, no account)
+  2) Free hosted tier (free key, rate limited)
+  3) My own paid key (best quality)
+```
+
+Change your mind any time with:
+
+```bash
+python main.py --setup
+```
+
+If a call fails mid-run (Ollama not running, bad key, rate limit), the agent offers the same menu so you can switch and continue.
+
+Any OpenAI-compatible endpoint works. For scripts and CI, skip the menu with environment variables:
+
+```bash
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen2.5-coder:7b
+LLM_API_KEY=            # not needed for local models
+```
+
+Your choice is saved in `~/.config/ai-engineer-agent/config.json` (owner-only permissions). Free-tier limits and default model names change often, so check your provider's current docs. Small local models are less reliable at precise code edits than hosted ones.
+
+Run the tests with `python -m unittest discover -s tests -t .`
+
+---
+
+## 🔒 Security notice
+
+To check a fix, the agent installs the target repo's dependencies and runs its tests **on your machine**. That runs code written by whoever owns that repo, and there is no sandbox yet.
+
+What is protected today:
+
+* The repo's install and test commands do not receive your environment variables (`GITHUB_TOKEN`, `OPENAI_API_KEY`, `LLM_API_KEY`, cloud credentials and similar are dropped).
+* A repo's own `.ai-agent.yml` is ignored, because it can choose any command. Use `--trust-repo-config` only for repos you trust.
+
+What is **not** protected: a hostile repo can still read files on your disk, including `~/.config/ai-engineer-agent/config.json`. Only point the agent at repos you trust, or run it inside a throwaway VM or container. A Docker sandbox is planned.
+
+---
+
 ## 🧪 Running the Agent
 
 ```bash

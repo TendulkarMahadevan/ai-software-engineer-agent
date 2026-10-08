@@ -1,16 +1,23 @@
 import os
+import re
 from tools.github_tool import GitHubTool
-from tools.repo_search_tool import RepoSearchTool
+from tools.repo_search_tool import RepoSearchTool, is_test_file
 from tools.context_extractor import ContextExtractor
 from patch.pr_writer import PRWriter
 from llm.openai_client import LLMClient
 from utils.git_manager import GitManager
 from agent.keyword_extractor import KeywordExtractor
-from utils.test_runner import TestRunner
+from utils.test_runner import TestRunner, ENV_ERRORS
+from agent.edit_blocks import EDIT_FORMAT_INSTRUCTIONS, apply_edit_response, feedback_for
+
+# How many times the model may correct a reply whose SEARCH/REPLACE edits did not apply
+MAX_EDIT_RETRIES = 2
 
 class CodeAgent:
 
-    def __init__(self):
+    def __init__(self, trust_repo_config=False):
+        # Whether the target repo's own .ai-agent.yml may set the commands we run
+        self.trust_repo_config = trust_repo_config
         self.github = GitHubTool()
         self.search = RepoSearchTool()
         self.extractor = ContextExtractor()
@@ -56,10 +63,13 @@ class CodeAgent:
         # ---- CREATE BRANCH EARLY ----
         branch_name = f"ai-fix-issue-{issue_number}"
         self.git_manager.create_branch(local_path, branch_name)
+        # Everything the agent changes is judged against this commit, so a retry
+        # cannot hide behind (or be hidden by) the first attempt's diff.
+        base_sha = self.git_manager.head_sha(local_path)
         
         # ---- RUN BASELINE TESTS BEFORE ANY MODIFICATION ----
         print("[AI-ENGINEER] Running baseline tests before modification...")
-        baseline_test = TestRunner.run_tests(local_path)
+        baseline_test = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
         baseline_output = (
             baseline_test.get("stdout", "") +
@@ -67,14 +77,30 @@ class CodeAgent:
             baseline_test.get("stderr", "")
         )
 
-        if baseline_test["returncode"] != 0:
+        baseline_status = baseline_test.get("status", "failed")
+        tests_unrunnable = baseline_status in ENV_ERRORS
+        print(f"[AI-ENGINEER] Test runner: {baseline_test.get('runner', 'unknown')}")
+
+        if baseline_status == "passed":
+            print("[AI-ENGINEER] Baseline tests passed.")
+
+        elif baseline_status == "no_tests_found":
+            print("[AI-ENGINEER] No tests detected for this repo. "
+                  "Continuing without test validation.")
+
+        elif baseline_status in ENV_ERRORS:
+            print(f"[AI-ENGINEER] Could not run baseline tests ({baseline_status}). "
+                  "This is a setup problem, not a failing test. "
+                  "The patch will not be validated and no PR text will be written.")
+            if baseline_test.get("reason"):
+                print(f"[AI-ENGINEER] Reason: {baseline_test['reason']}")
+            print(baseline_output[:2000])
+
+        else:
             print("[AI-ENGINEER] Baseline tests are already failing.")
             print("\n===== BASELINE TEST OUTPUT =====\n")
             print(baseline_output[:2000])
             print("\n===============================\n")
-
-        else:
-            print("[AI-ENGINEER] Baseline tests passed.")
 
 
         # ---- KEYWORD EXTRACTION ----
@@ -91,32 +117,22 @@ class CodeAgent:
             return
 
         # ---- FILTER OUT TEST FILES ----
-        non_test_files = [f for f in files if ".test." not in f]
+        non_test_files = [f for f in files if not is_test_file(f)]
 
         if not non_test_files:
             non_test_files = files  # fallback
 
         # ---- FILE SCORING ----
+        # The search step already ranks by keyword relevance, and sorted() is
+        # stable, so this only demotes files that are poor patch targets.
+        # No repo-specific heuristics here: it must work on any codebase.
         def score_file(path):
             score = 0
             lower = path.lower()
 
-            # Boost inbound-related signals
-            if any(x in lower for x in ["gateway", "raw", "update", "poll", "dispatch", "handler", "listener"]):
-                score += 6
-
-            # Penalize outbound-focused signals
-            if any(x in lower for x in ["send", "outbound", "publisher", "notify"]):
-                score -= 3
-                
-             # Dynamic Boost Based on Issue Analysis
-            if "inbound" in issue_analysis.lower():
-                if any(x in lower for x in ["handler", "listener", "dispatch", "poll"]):
-                    score += 5
-
-            if "database" in issue_analysis.lower():
-                if any(x in lower for x in ["repository", "model", "db"]):
-                    score += 5
+            # Penalize generated / minified / config-like files
+            if any(x in lower for x in [".min.", ".generated.", ".pb.", "_pb2", "migrations/"]):
+                score -= 5
 
             # Penalize very large files
             try:
@@ -124,12 +140,29 @@ class CodeAgent:
                 size = os.path.getsize(full_path)
                 if size > 50000:
                     score -= 5
-            except:
+            except OSError:
                 pass
 
             return score
 
-        ranked_files = sorted(non_test_files, key=score_file, reverse=True)
+        # Files that DEFINE an identifier named in the issue (a constant, class or
+        # function) are the best patch targets, even if keyword search ranked them low.
+        identifiers = self.keyword_extractor.extract_identifiers(issue_text)
+        definitions = self.search.find_definitions(local_path, identifiers) if identifiers else {}
+        if definitions:
+            print(f"[AI-ENGINEER] Identifiers from issue: {identifiers}")
+            print(f"[AI-ENGINEER] Defined in: {sorted(definitions, key=definitions.get, reverse=True)[:5]}")
+
+        candidates = list(non_test_files)
+        for path in definitions:
+            if path not in candidates and not is_test_file(path):
+                candidates.append(path)
+
+        ranked_files = sorted(
+            candidates,
+            key=lambda path: (definitions.get(path, 0), score_file(path)),
+            reverse=True,
+        )
 
         if not ranked_files:
             print("No candidate files after ranking.")
@@ -142,8 +175,8 @@ class CodeAgent:
         # ---- SELECT RELATED FILES FOR CONTEXT (Mini-RAG) ----
         related_files = []
 
-        for f in files:
-            if f != target_file and ".test." not in f:
+        for f in ranked_files:
+            if f != target_file and not is_test_file(f):
                 related_files.append(f)
 
         # Take top 2 related files max
@@ -167,42 +200,38 @@ class CodeAgent:
 
         file_path = os.path.join(local_path, target_file)
 
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            file_content = f.read()
+        try:
+            # newline="" keeps CRLF files CRLF; strict decoding never drops bytes silently
+            with open(file_path, "r", encoding="utf-8", newline="") as f:
+                file_content = f.read()
+        except UnicodeDecodeError:
+            print("[AI-ENGINEER] The target file is not valid UTF-8 text, so it is not edited.")
+            return
 
-        # ---- FULL FILE REWRITE ----
-        print("[AI-ENGINEER] Rewriting file using LLM...")
+        # ---- SEARCH/REPLACE EDITS ----
+        print("[AI-ENGINEER] Asking the LLM for SEARCH/REPLACE edits...")
 
-        system_prompt = """
+        system_prompt = f"""
         You are a senior software engineer.
 
-        You will receive:
-        - A GitHub issue
-        - A file path
-        - The full content of the file
-
-        Your task:
-        Modify the file ONLY as necessary to fix the issue.
+        You will receive a GitHub issue, a file path and the full content of the file.
+        Fix the issue by changing the file as little as possible.
 
         STRICT RULES:
-        - Do NOT remove comments.
         - Do NOT refactor unrelated code.
-        - Do NOT change formatting unnecessarily.
-        - Do NOT simplify existing logic.
+        - Do NOT remove comments.
+        - Do NOT change formatting you do not need to change.
         - Make the MINIMAL changes required.
-        - Preserve all existing code except what must change.
-        - Return the FULL updated file content.
-        - Do NOT include explanations.
-        - Do NOT include markdown.
-        - Return only valid code.
+
+        {EDIT_FORMAT_INSTRUCTIONS}
         """
 
         user_prompt = f"""
         GitHub Issue:
         {issue_text}
 
-        Current failing test output (before modification):
-        {baseline_output}
+        Test output before modification:
+        {baseline_output[:4000]}
 
         Target file:
         {target_file}
@@ -210,14 +239,17 @@ class CodeAgent:
         Target file content:
         {file_content}
 
-        Identify the root cause of the failing tests.
-        Fix the issue with minimal changes.
-        Return ONLY the modified code block.
-        Do NOT return the entire file.
-        Do NOT include explanations.
+        Identify the root cause of the issue, then fix it with the smallest
+        SEARCH/REPLACE blocks that work.
         """
 
-        new_content = self.llm.generate(system_prompt, user_prompt)
+        new_content = self._edit_file(system_prompt, user_prompt, file_content)
+
+        if new_content is None:
+            print("[AI-ENGINEER] No patch applied: the model's edits did not match the file "
+                  f"after {MAX_EDIT_RETRIES + 1} attempts. The file was left untouched and "
+                  "no PR text will be written.")
+            return
 
         # ---- OVERWRITE FILE ----
         self.git_manager.overwrite_file(local_path, target_file, new_content)
@@ -227,18 +259,49 @@ class CodeAgent:
         self.git_manager.commit_changes(local_path, commit_message)
         
         # ---- SHOW DIFF ----
-        diff_output = self.git_manager.get_diff(local_path)
+        diff_output = self.git_manager.get_diff(local_path, base_sha)
 
         print("\n===== LOCAL GIT DIFF =====\n")
         print(diff_output)
         
         # ---- RUN TESTS ----
-        print("[AI-ENGINEER] Running automated tests...")
-        test_result = TestRunner.run_tests(local_path)
+        if tests_unrunnable:
+            # Same setup problem as the baseline: running again would only repeat it
+            print("[AI-ENGINEER] Skipping tests and retry: the test setup is broken "
+                  "(see the baseline error above).")
+            test_result = baseline_test
+            test_status = "Tests could not be run (setup problem); patch is not validated."
+        else:
+            print("[AI-ENGINEER] Running automated tests...")
+            test_result = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
-        if test_result["returncode"] == 0:
+        post_status = test_result.get("status", "failed")
+
+        if (not tests_unrunnable and post_status == "error"
+                and test_result.get("kind") == "collection_import"):
+            # The baseline could run, so this import problem came from the patch
+            print("[AI-ENGINEER] The change broke an import: "
+                  f"{test_result.get('reason', '')}")
+            post_status = "failed"
+
+        if tests_unrunnable:
+            pass
+
+        elif post_status == "passed":
             print("[AI-ENGINEER] Tests passed ✅")
             test_status = "Tests passed successfully."
+
+        elif post_status == "no_tests_found":
+            print("[AI-ENGINEER] No tests detected, so the patch is not validated.")
+            test_status = "No tests detected; patch is not validated."
+
+        elif post_status in ENV_ERRORS:
+            print(f"[AI-ENGINEER] Could not run tests after the change ({post_status}). "
+                  "No retry and no PR text.")
+            print(test_result["stderr"][-1500:])
+            test_status = "Tests could not be run; patch is not validated."
+            tests_unrunnable = True
+
         else:
             print("[AI-ENGINEER] Tests failed ❌")
             test_status = "Tests failed. Attempting automatic retry..."
@@ -254,33 +317,66 @@ class CodeAgent:
             {diff_output}
 
             Test Failure Logs:
-            {test_result["stdout"]}
+            {test_result["stdout"][-3000:]}
+            {test_result["stderr"][-2000:]}
+
+            Target file: {target_file}
+
+            Current content of the target file (after the previous change):
+            {new_content}
 
             Fix the test errors WITHOUT removing unrelated logic.
-            Make minimal changes.
-            Return only valid code.
+            Use the smallest SEARCH/REPLACE blocks that work. The SEARCH lines must be
+            copied from the current content shown above.
             """
 
-            retry_content = self.llm.generate(
-                "You are a senior engineer fixing failing tests.",
-                retry_prompt
+            retry_content = self._edit_file(
+                f"You are a senior engineer fixing failing tests.\n\n{EDIT_FORMAT_INSTRUCTIONS}",
+                retry_prompt,
+                new_content,
             )
 
-            self.git_manager.overwrite_file(local_path, target_file, retry_content)
-            self.git_manager.commit_changes(local_path, "Retry fix after test failure")
-
-            print("[AI-ENGINEER] Re-running tests after retry...")
-            test_result = TestRunner.run_tests(local_path)
-
-            if test_result["returncode"] == 0:
-                print("[AI-ENGINEER] Tests passed after retry ✅")
-                test_status = "Tests passed after automatic retry."
+            if retry_content is None:
+                print("[AI-ENGINEER] The retry's edits could not be applied. "
+                      "Keeping the first attempt.")
+                test_status = "Tests failed; the retry's edits could not be applied."
             else:
-                print("[AI-ENGINEER] Tests still failing ❌")
-                test_status = "Tests failed even after retry."
+                self.git_manager.overwrite_file(local_path, target_file, retry_content)
+                self.git_manager.commit_changes(local_path, "Retry fix after test failure")
+
+                print("[AI-ENGINEER] Re-running tests after retry...")
+                test_result = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
+
+                retry_status = test_result.get("status")
+                if retry_status == "error" and test_result.get("kind") == "collection_import":
+                    retry_status = "failed"  # the retry broke an import, so it is a failure
+
+                if retry_status == "passed":
+                    print("[AI-ENGINEER] Tests passed after retry ✅")
+                    test_status = "Tests passed after automatic retry."
+                elif retry_status in ENV_ERRORS:
+                    print("[AI-ENGINEER] Tests could not be run after the retry.")
+                    test_status = "Tests could not be run; patch is not validated."
+                    tests_unrunnable = True
+                else:
+                    print("[AI-ENGINEER] Tests still failing ❌")
+                    test_status = "Tests failed even after retry."
 
 
         print(test_result["stdout"])
+
+        # The retry may have changed the file again: every guard below must judge the
+        # FINAL change against the original commit, not the first attempt.
+        final_diff = self.git_manager.get_diff(local_path, base_sha)
+        if final_diff != diff_output:
+            diff_output = final_diff
+            print("\n===== FINAL LOCAL GIT DIFF (after retry) =====\n")
+            print(diff_output)
+
+        if tests_unrunnable:
+            print("[AI-ENGINEER] Review the diff above by hand. Not generating PR text "
+                  "for a patch that could not be tested.")
+            return
 
         
         if len(diff_output.splitlines()) < 5:
@@ -308,13 +404,27 @@ class CodeAgent:
             return
         
         # ---- FUNCTION DELETION GUARD ----
-        deleted_functions = [
-            line for line in change_lines
-            if line.startswith("-function") or line.startswith("-async function")
-        ]
+        # Language-agnostic: a definition is "deleted" only if its name was
+        # removed and never re-added (so editing a signature is allowed).
+        definition_re = re.compile(
+            r"^\s*(?:export\s+)?(?:public\s+|private\s+|protected\s+|static\s+|async\s+|pub\s+)*"
+            r"(?:def|function|func|fn|class|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)"
+        )
+
+        def definition_names(prefix):
+            names = set()
+            for line in change_lines:
+                if line.startswith(prefix):
+                    match = definition_re.match(line[1:])
+                    if match:
+                        names.add(match.group(1))
+            return names
+
+        deleted_functions = definition_names("-") - definition_names("+")
 
         if deleted_functions:
-            print("[AI-ENGINEER] Detected function deletion. Aborting unsafe modification.")
+            print(f"[AI-ENGINEER] Detected deletion of: {', '.join(sorted(deleted_functions))}. "
+                  "Aborting unsafe modification.")
             return
 
         # ---- PR DESCRIPTION ----
@@ -323,6 +433,28 @@ class CodeAgent:
 
         print("\n===== PR DESCRIPTION =====\n")
         print(pr)
+
+    def _edit_file(self, system_prompt, user_prompt, original):
+        """
+        Asks the model for SEARCH/REPLACE edits and applies them to `original`.
+        When the edits do not apply, the problem is sent back to the model for up to
+        MAX_EDIT_RETRIES corrections. Returns the new file text, or None if nothing applied.
+        """
+        prompt = user_prompt
+
+        for attempt in range(MAX_EDIT_RETRIES + 1):
+            reply = self.llm.generate(system_prompt, prompt)
+            result = apply_edit_response(original, reply)
+
+            if result.ok:
+                return result.content
+
+            for error in result.errors:
+                print(f"[AI-ENGINEER] Edit not applied (attempt {attempt + 1}): "
+                      f"{error.splitlines()[0]}")
+            prompt = user_prompt + feedback_for(reply, result.errors)
+
+        return None
 
     def log(self, step):
         print(f"[AI-ENGINEER] {step}")
