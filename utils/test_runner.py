@@ -47,6 +47,9 @@ SAFE_ENV_PREFIXES = ("LC_",)
 
 REPO_CONFIG_NAME = ".ai-agent.yml"
 
+# `E   ImportError: ...` / `E   ModuleNotFoundError: ...` lines in pytest's report
+IMPORT_ERROR_LINE = re.compile(r"^E\s+(?:ImportError|ModuleNotFoundError): (.+)$", re.MULTILINE)
+
 PYTEST_NAME = "python (pytest)"
 # pytest exit codes: 3 = internal error, 4 = usage error (bad flag, missing plugin),
 # 5 = no tests collected. 3 and 4 are setup problems, not failing tests.
@@ -70,6 +73,9 @@ class TestRunner:
       stdout, stderr : combined output of the install and test steps
       status : passed | failed | no_tests_found | tool_missing | timeout | error
       runner : human readable name of the detected runner
+      reason : one line explaining a setup error (empty otherwise)
+      kind : machine readable label for some setup errors, for example
+             "collection_import" (a module failed to import while collecting tests)
     """
 
     # Stops pytest from trying to collect tests in these folders
@@ -126,6 +132,7 @@ class TestRunner:
                     status = res["status"] if res["status"] != FAILED else ERROR
                     return TestRunner._result(
                         res["returncode"] or -1, out_log, err_log, status, runner_name,
+                        reason=f"Install step failed: {' '.join(cmd)}", kind="install",
                     )
             if install_cmds:
                 TestRunner._write(marker, fingerprint)
@@ -138,16 +145,30 @@ class TestRunner:
 
         status = res["status"]
 
+        reason, kind = "", ""
+
         if runner_name == PYTEST_NAME:
             if res["returncode"] == PYTEST_NO_TESTS:
                 status = NO_TESTS
             elif res["returncode"] in PYTEST_SETUP_ERRORS:
                 status = ERROR
-                err_log += ("\n[TEST-RUNNER] pytest could not start (usage or internal error). "
-                            "This is a setup problem, not a failing test.\n")
+                kind = "pytest_usage"
+                reason = ("pytest could not start (usage or internal error). "
+                          "This is a setup problem, not a failing test.")
+            elif status == FAILED:
+                problem = TestRunner._collection_import_problem(res["stdout"] + res["stderr"])
+                if problem:
+                    status = ERROR
+                    kind = "collection_import"
+                    reason = (f"pytest could not import a module while collecting tests ({problem}). "
+                              "That is a missing dependency or a broken import, not a failing test.")
+
+        if reason:
+            err_log += f"\n[TEST-RUNNER] {reason}\n"
 
         returncode = 0 if status == PASSED else (res["returncode"] or -1)
-        return TestRunner._result(returncode, out_log, err_log, status, runner_name)
+        return TestRunner._result(returncode, out_log, err_log, status, runner_name,
+                                  reason=reason, kind=kind)
 
     # ---------- planning ----------
 
@@ -356,6 +377,19 @@ class TestRunner:
         }
 
     @staticmethod
+    def _collection_import_problem(output):
+        """
+        The import error message if pytest stopped while collecting because a module
+        failed to import, else None. Needs both the "ERROR collecting" header and an
+        ImportError line, so an ordinary failing test that mentions ImportError in an
+        assertion is not matched.
+        """
+        if "ERROR collecting" not in output:
+            return None
+        match = IMPORT_ERROR_LINE.search(output)
+        return match.group(1).strip()[:200] if match else None
+
+    @staticmethod
     def _read(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -425,11 +459,13 @@ class TestRunner:
             }
 
     @staticmethod
-    def _result(returncode, stdout, stderr, status, runner):
+    def _result(returncode, stdout, stderr, status, runner, reason="", kind=""):
         return {
             "returncode": returncode,
             "stdout": stdout,
             "stderr": stderr,
             "status": status,
             "runner": runner,
+            "reason": reason,
+            "kind": kind,
         }

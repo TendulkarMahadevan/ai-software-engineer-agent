@@ -265,5 +265,67 @@ class SandboxHygieneTests(unittest.TestCase):
         self.assertNotIn("Ignoring", text)
 
 
+class CollectionImportTests(unittest.TestCase):
+    """A module that cannot be imported while collecting is a setup problem, not a failing test."""
+
+    COLLECTION_ERROR = (
+        "==== ERRORS ====\n"
+        "____ ERROR collecting src/pkg/lang.py ____\n"
+        "src/pkg/lang.py:18: in <module>\n"
+        "    raise ImportError(\n"
+        "E   ImportError: langcodes is required for language code normalization.\n"
+        "!!!! stopping after 1 failures !!!!\n"
+    )
+
+    def run_pytest(self, returncode, stdout):
+        repo = make_repo({"pyproject.toml": "[project]\nname='x'\n"})
+
+        def fake_run(cmd, cwd, env, timeout):
+            is_test = "pytest" in cmd and "-x" in cmd
+            rc = returncode if is_test else 0
+            return {"returncode": rc, "stdout": stdout if is_test else "", "stderr": "",
+                    "status": tr.PASSED if rc == 0 else tr.FAILED}
+
+        with mock.patch.object(TestRunner, "_run", side_effect=fake_run):
+            return TestRunner.run_tests(repo)
+
+    def test_import_error_during_collection_is_a_setup_error(self):
+        result = self.run_pytest(2, self.COLLECTION_ERROR)
+        self.assertEqual(result["status"], tr.ERROR)
+        self.assertEqual(result["kind"], "collection_import")
+        self.assertIn("langcodes is required", result["reason"])
+        self.assertIn("not a failing test", result["reason"])
+
+    def test_module_not_found_is_detected_too(self):
+        out = "ERROR collecting tests/test_a.py\nE   ModuleNotFoundError: No module named 'yaml'\n"
+        result = self.run_pytest(2, out)
+        self.assertEqual(result["status"], tr.ERROR)
+        self.assertIn("No module named 'yaml'", result["reason"])
+
+    def test_a_real_failing_test_that_mentions_importerror_stays_failed(self):
+        out = ("____ test_x ____\n    assert 'ImportError' not in text\n"
+               "E   assert 'ImportError' not in 'ImportError: boom'\n1 failed in 0.1s\n")
+        result = self.run_pytest(1, out)
+        self.assertEqual(result["status"], tr.FAILED)
+        self.assertEqual(result["kind"], "")
+
+    def test_collection_error_that_is_not_an_import_error_stays_failed(self):
+        out = "ERROR collecting tests/test_a.py\nE   SyntaxError: invalid syntax\n"
+        self.assertEqual(self.run_pytest(2, out)["status"], tr.FAILED)
+
+    def test_usage_error_has_a_reason(self):
+        result = self.run_pytest(4, "usage: pytest [options]")
+        self.assertEqual((result["status"], result["kind"]), (tr.ERROR, "pytest_usage"))
+        self.assertTrue(result["reason"])
+
+    def test_failed_install_has_a_reason(self):
+        repo = make_repo({"pyproject.toml": "[project]\nname='x'\n"})
+        bad = {"returncode": 1, "stdout": "", "stderr": "boom", "status": tr.FAILED}
+        with mock.patch.object(TestRunner, "_run", return_value=bad):
+            result = TestRunner.run_tests(repo)
+        self.assertEqual((result["status"], result["kind"]), (tr.ERROR, "install"))
+        self.assertIn("Install step failed", result["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

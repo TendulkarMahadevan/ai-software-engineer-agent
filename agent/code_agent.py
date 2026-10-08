@@ -59,6 +59,9 @@ class CodeAgent:
         # ---- CREATE BRANCH EARLY ----
         branch_name = f"ai-fix-issue-{issue_number}"
         self.git_manager.create_branch(local_path, branch_name)
+        # Everything the agent changes is judged against this commit, so a retry
+        # cannot hide behind (or be hidden by) the first attempt's diff.
+        base_sha = self.git_manager.head_sha(local_path)
         
         # ---- RUN BASELINE TESTS BEFORE ANY MODIFICATION ----
         print("[AI-ENGINEER] Running baseline tests before modification...")
@@ -85,6 +88,8 @@ class CodeAgent:
             print(f"[AI-ENGINEER] Could not run baseline tests ({baseline_status}). "
                   "This is a setup problem, not a failing test. "
                   "The patch will not be validated and no PR text will be written.")
+            if baseline_test.get("reason"):
+                print(f"[AI-ENGINEER] Reason: {baseline_test['reason']}")
             print(baseline_output[:2000])
 
         else:
@@ -258,7 +263,7 @@ class CodeAgent:
         self.git_manager.commit_changes(local_path, commit_message)
         
         # ---- SHOW DIFF ----
-        diff_output = self.git_manager.get_diff(local_path)
+        diff_output = self.git_manager.get_diff(local_path, base_sha)
 
         print("\n===== LOCAL GIT DIFF =====\n")
         print(diff_output)
@@ -275,6 +280,13 @@ class CodeAgent:
             test_result = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
         post_status = test_result.get("status", "failed")
+
+        if (not tests_unrunnable and post_status == "error"
+                and test_result.get("kind") == "collection_import"):
+            # The baseline could run, so this import problem came from the patch
+            print("[AI-ENGINEER] The change broke an import: "
+                  f"{test_result.get('reason', '')}")
+            post_status = "failed"
 
         if tests_unrunnable:
             pass
@@ -342,10 +354,14 @@ class CodeAgent:
                 print("[AI-ENGINEER] Re-running tests after retry...")
                 test_result = TestRunner.run_tests(local_path, trust_repo_config=self.trust_repo_config)
 
-                if test_result.get("status") == "passed":
+                retry_status = test_result.get("status")
+                if retry_status == "error" and test_result.get("kind") == "collection_import":
+                    retry_status = "failed"  # the retry broke an import, so it is a failure
+
+                if retry_status == "passed":
                     print("[AI-ENGINEER] Tests passed after retry ✅")
                     test_status = "Tests passed after automatic retry."
-                elif test_result.get("status") in ENV_ERRORS:
+                elif retry_status in ENV_ERRORS:
                     print("[AI-ENGINEER] Tests could not be run after the retry.")
                     test_status = "Tests could not be run; patch is not validated."
                     tests_unrunnable = True
@@ -355,6 +371,14 @@ class CodeAgent:
 
 
         print(test_result["stdout"])
+
+        # The retry may have changed the file again: every guard below must judge the
+        # FINAL change against the original commit, not the first attempt.
+        final_diff = self.git_manager.get_diff(local_path, base_sha)
+        if final_diff != diff_output:
+            diff_output = final_diff
+            print("\n===== FINAL LOCAL GIT DIFF (after retry) =====\n")
+            print(diff_output)
 
         if tests_unrunnable:
             print("[AI-ENGINEER] Review the diff above by hand. Not generating PR text "

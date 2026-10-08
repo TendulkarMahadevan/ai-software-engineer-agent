@@ -26,9 +26,14 @@ class GitManager:
         repo.index.commit(message)
         print("[AI-ENGINEER] Changes committed")
 
-    def get_diff(self, local_path):
+    def head_sha(self, local_path):
+        """The commit currently checked out (used as the baseline for the final diff)."""
+        return git.Repo(local_path).head.commit.hexsha
+
+    def get_diff(self, local_path, base=None):
+        """Changes since `base` (a commit), or since the previous commit when omitted."""
         repo = git.Repo(local_path)
-        return repo.git.diff("HEAD~1")
+        return repo.git.diff(base or "HEAD~1")
 
     # FIXED PATCH CLEANER
     def clean_patch(self, text):
