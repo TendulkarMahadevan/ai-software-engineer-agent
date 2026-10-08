@@ -64,6 +64,8 @@ CI: GitHub Actions running the unit tests on each push.
    - On failure, the error ("block 2 matched 0 places") is fed back to the model and it retries, at most 2 retries.
    - If all retries fail, the file is left untouched, the agent prints "no patch applied", and no PR text is written. There is no fallback to whole-file rewrite.
 3. Execution safety (until a Docker sandbox exists). DONE (S3 A+B): install/test commands get a scrubbed environment (no `GITHUB_TOKEN`/API keys), and the target repo's `.ai-agent.yml` is ignored unless `--trust-repo-config` is passed; README security notice added. TODO: consent as `confirm_commands()` in `utils/test_runner.py`: before running any install or test command from a target repo, print the exact commands and require `y` (a `--yes` flag for CI). The README warns that target-repo code runs on the user's machine. The eval script prints the full command list once per repo up front and asks for one `y` per repo (or uses `--yes` only for the vetted repos listed in `evals/README.md`); the Next Steps 0 baseline uses the same mechanism. Evals and demos use well-known repos only. A minimal Docker sandbox is built before the GitHub Action.
+3a. `CodeAgent.run` returns a plain result dict `{outcome, tests_status, changed_files, diff, pr_text, reason}` from every exit, with no new class (S1, R3). The eval in step 4 reads it.
+3b. `GitManager.clone_repo` clones with `--depth 1`; the agent never reads git history because every diff is taken against the recorded base commit (S2a, R4). Accepted con: repos that compute their version from git tags may install with a fallback version.
 4. Build the eval as one script, `evals/run_eval.py` (functions, no class), with the issue list and baseline results in `evals/README.md`, and re-run the 5 issues (see Success Criteria for the exact method).
 5. Record the demo GIF from the best representative issue and rewrite the README headline around "no paid key".
 6. Add a `pyproject.toml` entry point for `pipx install`.
@@ -165,3 +167,357 @@ State: approved (A and B); pending (C reorder before pipx, and D consent prompt)
 Actual answer: "go with A and B now"
 Accepted scope: A and B only, implemented in utils/test_runner.py, agent/code_agent.py, main.py, README.md, with 7 new tests in tests/test_runner_and_search.py. Reordering Docker ahead of `pipx install` and the consent prompt stay pending.
 History: none.
+
+### R3: S1, CodeAgent.run returns nothing, so the eval cannot read an outcome
+Finding: S1, P2, confidence 9/10, agent/code_agent.py:29 `def run(self, owner, repo, issue_number):` has 9 bare `return` exits (lines 117, 169, 209, 252, 379, 385, 398, 404, 428); main.py:40 `agent.run(owner, repo, issue_number)` ignores the result. Reviewer: eng review.
+Plan baseline: Next Steps 4 and Success Criteria define a pass as "repo tests pass AND the patch touches the expected file"; no mechanism returns either fact. Nothing approved for this row.
+Runtime evidence: run() returns None on every path (read from the code above); TestRunner already returns result dicts (utils/test_runner.py `_result`).
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R3 run() output | prints only, returns None, pending | plain dict from every exit | none; eval reads printed text | none now; decide when the eval is built |
+| New class | none | none (a dict) | none | none |
+| Printed output | unchanged | unchanged | unchanged, but becomes an interface | unchanged |
+| Eval pass rule (approved) | tests pass AND expected file touched | computed from the dict | computed from scraped text | not computable until decided |
+| Other pending choices (R4 shallow clone, R5 clone reuse) | pending | pending | pending | pending |
+Question D4:
+D4 — Should CodeAgent.run return a result the eval can read? <gstack-qid:plan-eng-review-s1-run-result>
+
+Project/branch/task: engineering review of docs/designs/no-paid-key-issue-fixer.md on feat/multi-language-runner (finding S1).
+ELI10: Right now the agent only prints what happened and returns nothing. The plan's eval needs to know, after each run, whether the tests passed and which file changed. Without a returned result, the eval would have to read the printed text, which breaks whenever a message is reworded.
+Stakes if we pick wrong: the pass rate the README will quote could be wrong, or silently stop working after a wording change.
+Recommendation: A because it reuses the result-dict pattern TestRunner already uses and costs about 20 minutes.
+Completeness: A=9/10, B=4/10, C=3/10
+Pros / cons:
+A) Return a result dict (recommended)
+  ✅ Every exit returns {outcome, tests_status, changed_files, diff, pr_text, reason}; the eval and tests read facts, not text.
+  ✅ Follows the dict style of TestRunner._result and adds no class (human: ~2 hours / CC: ~20 min).
+  ❌ All 9 exits of a long method must be edited, so the agent-flow tests need updating too.
+B) Scrape printed output
+  ✅ No change to run() at all.
+  ❌ Every reworded print message can silently break the eval, and "expected file touched" is hard to read from text (human: ~1 day / CC: ~1 hour, plus upkeep).
+C) Defer until the eval is built
+  ✅ Keeps today's diff small and changes nothing now.
+  ❌ Leaves Next Steps 4 blocked on this change, and the agent-flow tests keep checking printed strings.
+Net: a small, one-time change now versus a fragile eval later.
+Header: Run result
+Options:
+A) Return a result dict
+Every exit of run() returns {outcome, tests_status, changed_files, diff, pr_text, reason}; main.py ignores it. Adds no class. Pros: the eval and tests read facts, not printed text. Cons: all 9 exits must be edited. Effort human ~2 hours / CC ~20 min.
+B) Scrape printed output
+run() is unchanged; the eval parses the printed lines. Pros: no code change. Cons: any reworded message can silently break the eval, and the touched file is hard to read from text. Effort human ~1 day / CC ~1 hour plus upkeep.
+C) Defer until the eval
+Nothing changes now; the choice is revisited when Next Steps 4 starts. Pros: smallest diff today. Cons: leaves the eval blocked and tests asserting on printed strings.
+
+State: approved
+Actual answer: D4 answered A) Return a result dict (recommended), via AskUserQuestion.
+Accepted scope: CodeAgent.run returns a plain dict {outcome, tests_status, changed_files, diff, pr_text, reason} from every exit (no new class); main.py ignores it; the agent-flow tests assert on the dict. The code change is not yet made: implementation needs separate authority.
+History: first sent as D4; no earlier values.
+
+### R4: S2a, every clone downloads the repo's full history
+Finding: S2a, P2, confidence 9/10, utils/git_manager.py:14 `git.Repo.clone_from(repo_url, local_path)` with no depth or filter. Reviewer: eng review.
+Plan baseline: the plan says nothing about clone size. Nothing approved for this row.
+Runtime evidence: a real run on virtual-labs/bugs-virtual-labs sat silent for minutes while the clone grew past 340 MB (observed with du during the run); the agent only reads the latest files and now diffs against a recorded commit (agent/code_agent.py `base_sha`), not HEAD~1.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R4 clone depth | full history, pending | --depth 1 | full history (unchanged) | --filter=blob:none (all commits, blobs on demand) |
+| Tags and history available to the repo's install/tests | yes | no | yes | yes |
+| Download size on a large repo | large | smallest | large | medium |
+| Network needed after cloning | no | no | no | yes, for old blobs only if something reads them |
+| Code and tests | none | one multi_options argument plus 1 test | none | one multi_options argument plus 1 test |
+| Other pending choices (R5 clone reuse) | pending | pending | pending | pending |
+Question D5:
+D5 — How much git history should the agent download? <gstack-qid:plan-eng-review-s2a-clone-depth>
+
+Project/branch/task: engineering review of docs/designs/no-paid-key-issue-fixer.md on feat/multi-language-runner (finding S2a).
+ELI10: The agent only needs the latest version of the files, but it downloads every past version too. On a big repo that is hundreds of megabytes and several silent minutes before anything happens. A shallow clone downloads only the latest files.
+Stakes if we pick wrong: big repos feel frozen; but a repo whose install reads its git history (for example to compute a version from tags) could behave differently with no history.
+Recommendation: A because the agent never reads history and the eval will clone many times.
+Note: options differ in kind (speed against history), so no completeness score.
+Pros / cons:
+A) Shallow clone, latest files only (recommended)
+  ✅ Fastest and smallest; a large repo downloads in seconds instead of minutes (human: ~1 hour / CC: ~5 min plus 1 test).
+  ✅ Nothing in the agent reads history after the base-commit change.
+  ❌ A repo that computes its version from git tags may install with a fallback version, or fail.
+B) Keep the full clone
+  ✅ History and tags exist exactly as in the real repo; no behavior change.
+  ❌ Large repos stay slow, and every eval run pays the full download.
+C) Partial clone, history without file contents
+  ✅ Keeps history and tags, but downloads far less than a full clone.
+  ❌ Some git operations may need the network later, and the download is still larger than A.
+Net: speed and size against keeping git history for repos that need it.
+Header: Clone depth
+Options:
+A) Shallow clone
+Clone with --depth 1: only the latest files. Pros: seconds instead of minutes on big repos; the agent does not use history. Cons: repos that derive their version from git tags may install differently. Effort human ~1 hour / CC ~5 min plus 1 test.
+B) Keep full clone
+No change. Pros: exactly the real repo, history and tags included. Cons: big repos stay slow and each eval run repeats the download.
+C) Partial clone
+Clone with --filter=blob:none: all commits and tags, file contents only when needed. Pros: history kept, smaller than full. Cons: may need the network later and is larger than A. Effort human ~1 hour / CC ~5 min plus 1 test.
+
+State: approved
+Actual answer: D5 answered "Shallow clone" (option A), via AskUserQuestion.
+Accepted scope: GitManager.clone_repo clones with --depth 1 (latest files only), plus one test. Known con accepted: repos that derive their version from git tags may install with a fallback version. The code change is not yet made: implementation needs separate authority.
+History: first sent as D5; no earlier values.
+
+### R5: S2b, each eval run would clone and install from scratch
+Finding: S2b, P2, confidence 7/10, utils/git_manager.py:11 `local_path = tempfile.mkdtemp(prefix="ai_agent_repo_")` creates a new directory per run; the venv and install marker live inside the clone (utils/test_runner.py:118 `marker = os.path.join(repo_path, INSTALL_MARKER)`, :239 `venv_dir = os.path.join(repo_path, ".ai_agent_venv")`). Reviewer: eng review.
+Plan baseline: Success Criteria require 5 issues x 3 runs per tier (15 runs per tier). Shallow clone is approved separately (R4). Nothing approved for this row.
+Runtime evidence: install time per run is unknown; it was not timed and this shell has no network. The earlier yasbd run installed pytest, pytest-cov and `.[dev]` (pre-commit, pydoc-markdown, ruff) from scratch. pip and npm keep default download caches, so repeat installs are faster than the first.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R5 working directory per eval run | new clone every run, pending | one directory per issue, reset in place between runs | new shallow clone every run | new shallow clone every run, then measure |
+| Dependency install per run | every run | first run only | every run (pip/npm download caches help) | every run, timed |
+| Independence of the 15 runs | full | weaker (leftover caches and build files can carry over) | full | full |
+| New code | none | reset logic (checkout base, clean, delete branch) plus tests | none | install seconds recorded in evals/README.md |
+| Implementation approved here | none | yes | none beyond R4 | none; a threshold decides later |
+| Other pending choices | none | none | none | none |
+Question D6:
+D6 — Should the eval reuse one working copy per issue, or clone fresh for every run? <gstack-qid:plan-eng-review-s2b-clone-reuse>
+
+Project/branch/task: engineering review of docs/designs/no-paid-key-issue-fixer.md on feat/multi-language-runner (finding S2b).
+ELI10: The eval runs the agent 15 times per tier. Each run currently downloads the repo and installs its dependencies from scratch. Reusing one copy would save the installs, but runs would no longer start from an identical clean state, which matters because the pass rate is the number the README will quote.
+Stakes if we pick wrong: building reuse we do not need adds code and weakens the numbers; skipping it when installs take minutes makes the eval take hours.
+Recommendation: C because install time is unknown and fresh clones keep every run independent; measure it in the baseline and add reuse only if it is a real problem.
+Note: options differ in kind (speed against run independence), so no completeness score.
+Pros / cons:
+A) Reuse one copy per issue and reset it
+  ✅ Dependencies install once per issue, which could save hours across 15 runs per tier.
+  ❌ Leftover caches and build files can leak between runs, so the pass rate is less trustworthy (human: ~1 day / CC: ~1 hour plus tests).
+B) Fresh shallow clone every run
+  ✅ Every run starts identical and clean; no new code beyond the shallow clone already approved.
+  ❌ If installs take minutes, 15 runs per tier gets slow, and nothing tells us how slow.
+C) Fresh clone every run, measure first (recommended)
+  ✅ Keeps runs independent and records install seconds per run in the baseline, so the decision uses real numbers.
+  ✅ Reuse (A) is added later only if the median install exceeds 2 minutes; this approves no implementation now.
+  ❌ The baseline itself runs at the slower speed, and a second review pass may follow.
+Net: faster evals against runs you can trust, with real timing deciding.
+Header: Eval clone
+Options:
+A) Reuse and reset
+One working directory per issue, reset to the base commit between runs, dependencies installed once. Pros: could save hours. Cons: runs can leak into each other, so the pass rate is less trustworthy. Effort human ~1 day / CC ~1 hour plus tests.
+B) Fresh clone each run
+A new shallow clone and install for every run. Pros: identical clean starts, no new code. Cons: slow if installs take minutes, with no measurement to tell.
+C) Fresh, then measure
+A new shallow clone for every run, and the baseline records install seconds per run in evals/README.md. Reuse is added only if the median install exceeds 2 minutes. Pros: independent runs and a decision based on real timing. Cons: the baseline runs at the slower speed. Approves no implementation.
+
+State: pending
+Actual answer: unanswered
+Accepted scope: none
+History: none
+
+Approval readiness: PASS. Checked and approved by actual answers: R1 (D3, "Smaller arrangement"), R2 A and B (chat, "go with A and B now"), R3 (D4, A), R4 (D5, "Shallow clone"). Still pending, not accepted: R2 C and D, R5 (D6 was sent, the user asked to clarify and then asked to wrap up), N1, N2 and the test additions listed under Unresolved decisions.
+
+## Eng review: findings (/plan-eng-review, 2026-10-08)
+
+Target: docs/designs/no-paid-key-issue-fixer.md (approved /office-hours design), reviewed at commit a7b680c.
+Step 0: Scope Challenge: scope accepted as-is (the smaller arrangement in R1 keeps every feature).
+Outside voice: unavailable (Codex not installed; the native fallback needs TaskOutput, which this session does not provide). No clean-review credit is taken.
+
+### 1. Architecture review
+
+Flow of one run, with the guards this review checked:
+
+```
+issue ──► GitHubTool ──► LLM analysis ──► clone (R4: --depth 1) ──► base_sha
+                                                         │
+                         TestRunner baseline (env scrubbed, repo .ai-agent.yml ignored)
+                                   │                │
+                          setup error ──► show diff only, no retry, no PR text
+                                   │
+                    find_definitions ──► target file ──► LLM SEARCH/REPLACE edits
+                                                     │ no match: feedback, max 2 retries
+                                                     ▼ all fail: "No patch applied"
+                                   apply (all-or-nothing) ──► commit ──► tests
+                                   │ fail: one retry (edits again) ──► final diff vs base_sha
+                                   ▼
+                      guards: trivial / too large / deleted definition ──► PR text
+```
+
+Findings:
+- [P1] (confidence: 9/10) repo root: `agent/ config/ llm/ patch/ tools/ utils/` are six generic top-level packages, and neither `pyproject.toml` nor `setup.py` exists (`ls pyproject.toml setup.py` reports both missing). `pipx install` (Next Steps 6) would put top-level `utils`, `config`, `tools` and `patch` into site-packages, where they collide with other installed packages. Remedy N1 (pending): move them under one package name, add `pyproject.toml` with a console entry point, update imports and tests (human ~1 day / CC ~1 hour). Do this before other pending code work, because it touches every import.
+- [P3] (confidence: 8/10) agent/edit_blocks.py `DIVIDER_MARKER = re.compile(r"^={5,9}\s*$")`: a SEARCH region that contains a line made only of `=====` (a Markdown or reStructuredText underline) ends early. The failure is safe: the edit fails to apply and is reported, never half-applied. Known limitation, documented here, no change proposed.
+- [P1] (confidence: 9/10, carried from R2) utils/test_runner.py: environment secrets are protected, but a hostile repo can still read files on disk, including `~/.config/ai-engineer-agent/config.json`. R2 C (Docker before `pipx install`) and R2 D (consent prompt) are pending.
+- Distribution: `pipx install` ships before the Docker sandbox in the current plan; no CI workflow file exists (`.github` is missing) although the Distribution Plan names CI.
+
+Dispositions: N1 pending; divider limitation deferred (documented); R2 C and D pending; CI and entry point tracked as T4 and T7.
+
+### 2. Code quality review
+
+- [P2] (confidence: 10/10) agent/code_agent.py:185 `related_context = ""` and :193 `related_context += rel_content`: built and never added to any prompt, while the README advertises multi-file context. Already Next Steps 1 of the approved plan, so it needs no new decision; the README claim stays unverified until it ships.
+- [P3] (confidence: 8/10) `patch/patch_generator.py` (737 bytes) has no importer (only `patch.pr_writer` is imported, agent/code_agent.py:6); `GitManager.apply_patch` and `clean_patch` have no callers except each other (utils/git_manager.py:56); `agent/prompts.py` is empty (0 bytes). Remedy N2 (pending): delete them (human ~30 min / CC ~5 min).
+- Shared code: no extraction proposed. No candidate has two verified authored callers with net line savings.
+- Error handling: edit failures, setup errors and provider failures all produce a visible message or reason. No silent path found.
+- Diagrams: no touched file carries an ASCII diagram, so none is stale.
+
+Dispositions: related_context accepted (existing plan item); N2 pending.
+
+### 3. Test review
+
+Framework: Python `unittest` (108 tests in `tests/`), detected from the repo; no CLAUDE.md testing section exists.
+
+```
+CODE PATHS                                             USER FLOWS
+[+] agent/edit_blocks.py                               [+] First run with only OPENAI_API_KEY
+  ├── [★★★ TESTED] parse_blocks (7 error shapes)         ├── [★★  TESTED] ask once, remember (unit only)
+  ├── [★★★ TESTED] apply: unique/ambiguous/CRLF/UTF-8    └── [GAP] [→E2E] real tty run, menu then repo
+  └── [★★  TESTED] feedback_for                         [+] Real issue on a real repo
+[+] agent/code_agent.py                                 └── [GAP] [→E2E] clone, install, edit, test, guards
+  ├── [★★★ TESTED] _edit_file retry + total failure
+  ├── [★★★ TESTED] final diff after retry
+  ├── [★★★ TESTED] baseline setup error / import after patch
+  ├── [GAP] related_context in the prompt (Next Steps 1)
+  └── [GAP] result dict from every exit (R3, approved)
+[+] utils/test_runner.py
+  ├── [★★★ TESTED] status mapping, env scrub, repo config trust
+  └── [GAP] Node/Go/Rust/Java/Ruby plans (only Python tested)
+[+] tools/repo_search_tool.py
+  ├── [★★★ TESTED] find_definitions, parent wins
+  └── [GAP] search_files_local scoring order
+[+] llm/provider_config.py   [★★★ TESTED] 28 tests
+[+] llm/openai_client.py     [GAP] MAX_RECONFIGURES and non-tty stop
+[+] main.py                  [GAP] --trust-repo-config reaches CodeAgent
+[+] utils/git_manager.py
+  ├── [★★★ TESTED] head_sha / get_diff vs base
+  └── [GAP] clone_repo --depth 1 (R4, approved)
+
+COVERAGE: 13/22 paths tested (59%)  |  Code paths: 13/19 (68%)  |  User flows: 0/3 beyond unit level
+QUALITY: ★★★:12 ★★:1  |  GAPS: 9 (2 E2E, 0 eval)
+```
+
+LLM/eval scope: this plan changes the model-facing prompts (EDIT_FORMAT_INSTRUCTIONS and the edit/retry prompts). The eval is the suite: run the Next Steps 0 baseline before further changes and the same 15 runs after, on the local tier; add one format-conformance check per tier (does the reply parse into blocks that apply). Baseline to compare against: the Next Steps 0 result.
+
+Regression rule: the planned `run()` return change puts existing behavior (printed output and guards) at risk. The four agent-flow tests plus the final-diff test already protect it; the table-driven result-dict test (T6) keeps the contract.
+
+The Test Plan artifact lists each gap with its value card: `~/.gstack/projects/TendulkarMahadevan-ai-software-engineer-agent/tendulkar-feat-multi-language-runner-eng-review-test-plan-20261008-104901.md`. Proposed additions: 5 tests (clone depth, result dict exits, client reconfigure limit, non-Python runner plans, search scoring) plus the `--trust-repo-config` wiring test. Tests made obsolete by this plan: none.
+
+Dispositions: test additions pending (listed under Unresolved decisions).
+
+### 4. Performance review
+
+- [P3] (confidence: 7/10) tools/repo_search_tool.py:102 and :137 both run `for full_path, relative_path in self._source_files(local_path):`, so one run reads every source file twice (`search_files_local`, then `find_definitions`). Scale is unknown: a 5,000-file repo means about 10,000 reads, and no benchmark was made. Files over 500 KB are skipped (`MAX_FILE_BYTES`). Deferred until a real run is slow.
+- [P2] (confidence: 7/10) 15 runs per tier with unmeasured install time: R5 (pending). Clone size is handled by R4.
+
+Dispositions: double file walk deferred; R5 pending.
+
+### NOT in scope
+- Docker sandbox implementation: its order against `pipx install` is pending (R2 C), and the build is a separate step.
+- GitHub Action (label an issue, get a PR): needs PR creation and the sandbox first.
+- Scoreboard across 10 issues (Approach C of the design): revisit after the 5-issue eval.
+- Windows support for the runner and the env allowlist: untested.
+- Multi-file edits in one request: the edit format already allows several blocks, but one target file per run is unchanged.
+
+### What already exists
+- `TestRunner._result` dict style is reused for the planned `run()` result (R3).
+- `edit_blocks.py` reuses the existing `base_sha` diff and the retry flow in `code_agent.py`; `_clean_file_output` was removed because nothing needs it.
+- `find_definitions` and `extract_identifiers` already choose the target file; related-file snippets (Next Steps 1) will reuse them.
+- `confirm_commands()` (R2 D, pending) would sit beside `_build_plan`, which already returns the exact install and test commands.
+
+### Failure modes
+| New path | Realistic failure | Test | Error handling | User sees |
+|---|---|---|---|---|
+| SEARCH/REPLACE apply | model copies lines wrongly | yes | feedback, 2 retries | "Edit not applied (attempt N)", then "No patch applied" |
+| Shallow clone (R4) | version computed from git tags | no | none | install may fail or use a fallback version (visible as a setup error) |
+| Result dict (R3) | an exit forgets a key | gap (T6) | none | eval reports a wrong outcome |
+| Package rename (N1) | a missed import | gap | none | ImportError at start (visible) |
+| Hostile repo reads files | install script reads config.json | none possible | env scrub only | nothing; silent. **CRITICAL GAP**, pending R2 C |
+
+### Worktree parallelization strategy
+
+| Step | Modules touched | Depends on |
+|---|---|---|
+| N1 package rename | every directory, tests | none |
+| T1 result dict (R3) | agent/, tests/ | N1 |
+| T2 shallow clone (R4) | utils/, tests/ | N1 |
+| T3 related-file snippets | tools/, agent/ | N1 |
+| T5 eval script | evals/ | T1, T2 |
+| T7 CI workflow | .github/ | N1 |
+
+Lane A: N1 → T1 → T3 (shared agent/ and tools/). Lane B: T2 (utils/) and T7 (.github/) after N1. Lane C: T5 after T1 and T2.
+Execution order: do N1 first and alone. Then launch A and B in parallel, merge both, then C.
+Conflict flags: N1 conflicts with everything, so it runs sequentially; T1 and T3 both edit agent/code_agent.py, so keep them in one lane.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific finding above. Tasks marked "pending" wait for a decision.
+
+- [ ] **T1 (P2, human: ~2h / CC: ~20min)** — agent — return a result dict from every exit of `CodeAgent.run`
+  - Surfaced by: Scope Challenge S1 (R3, approved)
+  - Files: agent/code_agent.py, tests/test_agent_flow.py
+  - Verify: `python3 -m unittest discover -s tests -t .`
+- [ ] **T2 (P2, human: ~1h / CC: ~5min)** — git — clone with `--depth 1` and add a test
+  - Surfaced by: Scope Challenge S2a (R4, approved)
+  - Files: utils/git_manager.py, tests/test_agent_flow.py
+  - Verify: the new test asserts the clone is called with depth 1
+- [ ] **T3 (P2, human: ~1 day / CC: ~1h)** — agent — put capped related-file snippets into the edit prompt
+  - Surfaced by: Code Quality, agent/code_agent.py:185-193
+  - Files: tools/repo_search_tool.py, agent/code_agent.py
+  - Verify: a unit test of the snippet builder (caps, windows, unreadable files)
+- [ ] **T4 (P1, human: ~1 day / CC: ~1h)** — packaging — one package name, `pyproject.toml`, console entry point (pending N1)
+  - Surfaced by: Architecture, six generic top-level packages
+  - Files: pyproject.toml, main.py, agent/, config/, llm/, patch/, tools/, utils/, tests/
+  - Verify: `pipx install .` in a scratch environment, then run the command
+- [ ] **T5 (P2, human: ~1 day / CC: ~3h)** — evals — build `evals/run_eval.py` and `evals/README.md` (baseline first); clone reuse waits on R5
+  - Surfaced by: plan Next Steps 0 and 4
+  - Files: evals/run_eval.py, evals/README.md
+  - Verify: the 15-run baseline prints k/15 with install seconds
+- [ ] **T6 (P3, human: ~3h / CC: ~30min)** — tests — the five missing-path tests plus the flag-wiring test (pending)
+  - Surfaced by: Test review, 9 coverage gaps
+  - Files: tests/
+  - Verify: `python3 -m unittest discover -s tests -t .`
+- [ ] **T7 (P3, human: ~1h / CC: ~10min)** — ci — a GitHub Actions workflow that runs the unit tests
+  - Surfaced by: Distribution check
+  - Files: .github/workflows/tests.yml
+  - Verify: the workflow passes on a pushed branch
+- [ ] **T8 (P3, human: ~30min / CC: ~5min)** — cleanup — remove the dead code (pending N2)
+  - Surfaced by: Code Quality, no importers found
+  - Files: patch/patch_generator.py, utils/git_manager.py, agent/prompts.py
+  - Verify: the unit tests still pass
+
+### Unresolved decisions that may bite you later
+- R2 C: move the Docker sandbox ahead of `pipx install` (hostile repos can still read your files until then).
+- R2 D: the consent prompt `confirm_commands()` (a prompt only, no technical protection).
+- R5 (S2b): whether the eval reuses one working copy per issue or clones fresh each run (D6 was never answered).
+- N1: one package name and a `pyproject.toml` entry point before `pipx install`.
+- N2: remove the dead code.
+- Test additions (T6): whether to add the six missing-path tests.
+
+### Completion summary
+- Step 0: Scope Challenge: scope accepted as-is
+- Architecture Review: 2 issues found (plus 1 carried from R2)
+- Code Quality Review: 2 issues found
+- Test Review: diagram produced, 9 gaps identified
+- Performance Review: 2 issues found
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 0 items proposed (no TODOS.md; deferrals are tracked in the plan)
+- Failure modes: 1 critical gap flagged
+- Unresolved decisions: 6 in this review
+- Outside voice: codex, unavailable (not installed; native fallback unavailable)
+- Parallelization: 3 lanes, 2 parallel / 1 sequential
+- Lake Score: 0/1 (the only answer that carried completeness scores, D4, chose a 9/10 option)
+
+### Suppressed findings (appendix)
+- [P3] (confidence: 3/10) agent/keyword_extractor.py `extract_identifiers`: a capitalised word such as "JavaScript" could be read as a class name and trigger a harmless extra search. Suspicious, not verified, low impact.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Outside Review | codex (not installed) | Independent 2nd opinion | 1 | UNAVAILABLE | no outside review completed |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 15 issues, 1 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | not applicable: no UI scope |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**OUTSIDE COVERAGE:** codex, plan-review phase, unavailable (Codex CLI not installed; native fallback unavailable). No findings; this is missing coverage, not a clean review.
+**VERDICT:** no review is CLEAR; eng review required (ISSUES OPEN until the unresolved decisions below are answered).
+
+**UNRESOLVED DECISIONS:**
+- R2 C: move the Docker sandbox ahead of `pipx install`
+- R2 D: the consent prompt `confirm_commands()`
+- R5 (S2b): eval clone reuse versus fresh clone per run
+- N1: one package name and a `pyproject.toml` entry point before `pipx install`
+- N2: remove the dead code
+- T6: add the six missing-path tests
