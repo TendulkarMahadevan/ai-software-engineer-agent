@@ -8,6 +8,10 @@ from llm.openai_client import LLMClient
 from utils.git_manager import GitManager
 from agent.keyword_extractor import KeywordExtractor
 from utils.test_runner import TestRunner, ENV_ERRORS
+from agent.edit_blocks import EDIT_FORMAT_INSTRUCTIONS, apply_edit_response, feedback_for
+
+# How many times the model may correct a reply whose SEARCH/REPLACE edits did not apply
+MAX_EDIT_RETRIES = 2
 
 class CodeAgent:
 
@@ -196,42 +200,38 @@ class CodeAgent:
 
         file_path = os.path.join(local_path, target_file)
 
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            file_content = f.read()
+        try:
+            # newline="" keeps CRLF files CRLF; strict decoding never drops bytes silently
+            with open(file_path, "r", encoding="utf-8", newline="") as f:
+                file_content = f.read()
+        except UnicodeDecodeError:
+            print("[AI-ENGINEER] The target file is not valid UTF-8 text, so it is not edited.")
+            return
 
-        # ---- FULL FILE REWRITE ----
-        print("[AI-ENGINEER] Rewriting file using LLM...")
+        # ---- SEARCH/REPLACE EDITS ----
+        print("[AI-ENGINEER] Asking the LLM for SEARCH/REPLACE edits...")
 
-        system_prompt = """
+        system_prompt = f"""
         You are a senior software engineer.
 
-        You will receive:
-        - A GitHub issue
-        - A file path
-        - The full content of the file
-
-        Your task:
-        Modify the file ONLY as necessary to fix the issue.
+        You will receive a GitHub issue, a file path and the full content of the file.
+        Fix the issue by changing the file as little as possible.
 
         STRICT RULES:
-        - Do NOT remove comments.
         - Do NOT refactor unrelated code.
-        - Do NOT change formatting unnecessarily.
-        - Do NOT simplify existing logic.
+        - Do NOT remove comments.
+        - Do NOT change formatting you do not need to change.
         - Make the MINIMAL changes required.
-        - Preserve all existing code except what must change.
-        - Return the FULL updated file content.
-        - Do NOT include explanations.
-        - Do NOT include markdown.
-        - Return only valid code.
+
+        {EDIT_FORMAT_INSTRUCTIONS}
         """
 
         user_prompt = f"""
         GitHub Issue:
         {issue_text}
 
-        Current failing test output (before modification):
-        {baseline_output}
+        Test output before modification:
+        {baseline_output[:4000]}
 
         Target file:
         {target_file}
@@ -239,20 +239,16 @@ class CodeAgent:
         Target file content:
         {file_content}
 
-        Identify the root cause of the issue.
-        Fix it with minimal changes.
-        Return the COMPLETE updated file, from the first line to the last,
-        with every unchanged line kept exactly as it is.
-        Do NOT return only a snippet, a diff, or a summary.
-        Do NOT include explanations or markdown fences.
+        Identify the root cause of the issue, then fix it with the smallest
+        SEARCH/REPLACE blocks that work.
         """
 
-        raw_content = self.llm.generate(system_prompt, user_prompt)
-        new_content = self._clean_file_output(raw_content, file_content)
+        new_content = self._edit_file(system_prompt, user_prompt, file_content)
 
         if new_content is None:
-            print("[AI-ENGINEER] LLM output rejected (empty, truncated or snippet-only). "
-                  "File left untouched.")
+            print("[AI-ENGINEER] No patch applied: the model's edits did not match the file "
+                  f"after {MAX_EDIT_RETRIES + 1} attempts. The file was left untouched and "
+                  "no PR text will be written.")
             return
 
         # ---- OVERWRITE FILE ----
@@ -321,7 +317,7 @@ class CodeAgent:
             {diff_output}
 
             Test Failure Logs:
-            {test_result["stdout"]}
+            {test_result["stdout"][-3000:]}
             {test_result["stderr"][-2000:]}
 
             Target file: {target_file}
@@ -330,23 +326,20 @@ class CodeAgent:
             {new_content}
 
             Fix the test errors WITHOUT removing unrelated logic.
-            Make minimal changes.
-            Return the COMPLETE updated file, from the first line to the last,
-            with every unchanged line kept exactly as it is.
-            Do NOT return only a snippet, a diff, or a summary.
-            Do NOT include explanations or markdown fences.
+            Use the smallest SEARCH/REPLACE blocks that work. The SEARCH lines must be
+            copied from the current content shown above.
             """
 
-            retry_raw = self.llm.generate(
-                "You are a senior engineer fixing failing tests.",
-                retry_prompt
+            retry_content = self._edit_file(
+                f"You are a senior engineer fixing failing tests.\n\n{EDIT_FORMAT_INSTRUCTIONS}",
+                retry_prompt,
+                new_content,
             )
-            retry_content = self._clean_file_output(retry_raw, new_content)
 
             if retry_content is None:
-                print("[AI-ENGINEER] Retry output rejected (empty, truncated or snippet-only). "
+                print("[AI-ENGINEER] The retry's edits could not be applied. "
                       "Keeping the first attempt.")
-                test_status = "Tests failed; retry output was rejected."
+                test_status = "Tests failed; the retry's edits could not be applied."
             else:
                 self.git_manager.overwrite_file(local_path, target_file, retry_content)
                 self.git_manager.commit_changes(local_path, "Retry fix after test failure")
@@ -441,38 +434,27 @@ class CodeAgent:
         print("\n===== PR DESCRIPTION =====\n")
         print(pr)
 
-    def _clean_file_output(self, text, original):
+    def _edit_file(self, system_prompt, user_prompt, original):
         """
-        Turns raw LLM output into file content, or returns None if it can't be trusted.
-
-        Handles: markdown fences around the whole answer, empty output, and
-        snippet-only / truncated answers (far shorter than the original file).
+        Asks the model for SEARCH/REPLACE edits and applies them to `original`.
+        When the edits do not apply, the problem is sent back to the model for up to
+        MAX_EDIT_RETRIES corrections. Returns the new file text, or None if nothing applied.
         """
-        if not text or not text.strip():
-            return None
+        prompt = user_prompt
 
-        cleaned = text.strip()
+        for attempt in range(MAX_EDIT_RETRIES + 1):
+            reply = self.llm.generate(system_prompt, prompt)
+            result = apply_edit_response(original, reply)
 
-        fenced = re.match(r"^```[\w+.-]*\n(.*?)\n?```\s*$", cleaned, re.DOTALL)
-        if fenced:
-            cleaned = fenced.group(1)
+            if result.ok:
+                return result.content
 
-        # A stray fence line left inside means the model mixed prose and code
-        if cleaned.startswith("```") or cleaned.endswith("```"):
-            return None
+            for error in result.errors:
+                print(f"[AI-ENGINEER] Edit not applied (attempt {attempt + 1}): "
+                      f"{error.splitlines()[0]}")
+            prompt = user_prompt + feedback_for(reply, result.errors)
 
-        original_lines = len(original.splitlines())
-        new_lines = len(cleaned.splitlines())
-
-        # Only enforce the length check when there is enough original to compare
-        if original_lines >= 20 and new_lines < original_lines * 0.5:
-            return None
-
-        # Keep the file's trailing newline convention
-        if original.endswith("\n") and not cleaned.endswith("\n"):
-            cleaned += "\n"
-
-        return cleaned
+        return None
 
     def log(self, step):
         print(f"[AI-ENGINEER] {step}")

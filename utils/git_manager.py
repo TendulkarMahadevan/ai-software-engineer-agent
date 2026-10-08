@@ -99,7 +99,8 @@ class GitManager:
     def overwrite_file(self, repo_path, file_path, new_content):
         full_path = os.path.join(repo_path, file_path)
 
-        with open(full_path, "w", encoding="utf-8") as f:
+        # newline="" writes the text exactly as given (CRLF files stay CRLF)
+        with open(full_path, "w", encoding="utf-8", newline="") as f:
             f.write(new_content)
 
         print(f"[AI-ENGINEER] Overwrote {file_path}")

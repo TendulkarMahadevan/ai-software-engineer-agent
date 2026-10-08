@@ -59,7 +59,7 @@ CI: GitHub Actions running the unit tests on each push.
 ## Next Steps
 0. Baseline: run the CURRENT agent on the 5 eval issues, 3 runs per issue, on the local tier only (15 runs, same pass rule as Success Criteria), and save the result as k/15 in `evals/README.md`. The post-fix local-tier result uses the identical method, so the two numbers are directly comparable.
 1. Put related files into the prompt as capped snippets around identifier and keyword hits (fix the unused `related_context`). Built as one function in `tools/repo_search_tool.py`, not a new module or class.
-2. Replace whole-file rewrites with SEARCH/REPLACE blocks, as plain functions in a new `agent/edit_blocks.py` (no class). Apply policy:
+2. DONE (code and 35 tests, not yet measured on real issues): replace whole-file rewrites with SEARCH/REPLACE blocks, as plain functions in `agent/edit_blocks.py` (no class). Apply policy:
    - A SEARCH block must match exactly one place in the target file. Exact match first, then a whitespace-normalised match (trailing spaces, line endings). Zero or several matches is a failure.
    - On failure, the error ("block 2 matched 0 places") is fed back to the model and it retries, at most 2 retries.
    - If all retries fail, the file is left untouched, the agent prints "no patch applied", and no PR text is written. There is no fallback to whole-file rewrite.
